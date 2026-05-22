@@ -1,16 +1,14 @@
 use super::rss_common::RssProvider;
 
-const ALLOWED_DOMAINS: &[&str] = &[
-    "status.twilio.com",
-];
-const CONFIG_KEY: &str = "PROVIDER_TWILIO_FEED_URL";
+const ALLOWED_DOMAINS: &[&str] = &["status.imperva.com"];
+const CONFIG_KEY: &str = "PROVIDER_IMPERVA_FEED_URL";
 
 pub fn new(feed_url: String) -> RssProvider {
-    RssProvider::new("twilio", feed_url, CONFIG_KEY, ALLOWED_DOMAINS)
+    RssProvider::new("imperva", feed_url, CONFIG_KEY, ALLOWED_DOMAINS)
 }
 
 pub fn new_unvalidated(feed_url: String) -> RssProvider {
-    RssProvider::new_unvalidated("twilio", feed_url, CONFIG_KEY, ALLOWED_DOMAINS)
+    RssProvider::new_unvalidated("imperva", feed_url, CONFIG_KEY, ALLOWED_DOMAINS)
 }
 
 #[cfg(test)]
@@ -19,13 +17,7 @@ mod url_validation_tests {
 
     #[test]
     fn validates_allowed_domain() {
-        let provider = new("https://status.twilio.com/history.rss".into());
-        assert!(provider.validate_feed_url().is_ok());
-    }
-
-    #[test]
-    fn validates_subdomain() {
-        let provider = new("https://sub.status.twilio.com/history.rss".into());
+        let provider = new("https://status.imperva.com/history.rss".into());
         assert!(provider.validate_feed_url().is_ok());
     }
 
@@ -37,7 +29,7 @@ mod url_validation_tests {
         let err = result.unwrap_err();
         match err {
             crate::error::AppError::InvalidConfig { key, value } => {
-                assert_eq!(key, "PROVIDER_TWILIO_FEED_URL");
+                assert_eq!(key, "PROVIDER_IMPERVA_FEED_URL");
                 assert!(value.contains("not in allowed domains"));
             }
             other => panic!("expected InvalidConfig, got {:?}", other),

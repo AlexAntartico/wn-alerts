@@ -161,75 +161,45 @@ async fn telegram_notifier_handles_api_error() {
     }
 }
 
-const TWILIO_INCIDENTS_JSON: &str = r#"{
-  "incidents": [
-    {
-      "id": "cp-test-001",
-      "name": "SMS Delivery Delays",
-      "status": "identified",
-      "impact": "major",
-      "shortlink": "http://stspg.co/TEST001",
-      "incident_updates": [
-        {
-          "id": "upd-test-001",
-          "body": "We are investigating reports of SMS delivery delays.",
-          "status": "investigating",
-          "created_at": "2014-05-14T14:22:39.441-06:00"
-        },
-        {
-          "id": "upd-test-002",
-          "body": "Root cause identified, fix being deployed.",
-          "status": "identified",
-          "created_at": "2014-05-14T14:35:21.711-06:00"
-        }
-      ]
-    }
-  ]
-}"#;
-
 #[tokio::test]
-async fn twilio_provider_fetches_and_parses_json() {
+async fn twilio_provider_fetches_and_parses_rss() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("GET"))
-        .and(path("/api/v2/incidents.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(TWILIO_INCIDENTS_JSON))
+        .and(path("/history.rss"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RSS_ITEM_XML))
         .mount(&mock_server)
         .await;
 
-    let api_url = format!("{}/api/v2/incidents.json", mock_server.uri());
-    let provider = wn_alerts::providers::twilio::TwilioProvider::new_unvalidated(api_url);
+    let feed_url = format!("{}/history.rss", mock_server.uri());
+    let provider = wn_alerts::providers::twilio::new_unvalidated(feed_url);
     let client = build_client();
 
     let incidents = provider.check(&client).await.expect("check should succeed");
-    assert_eq!(incidents.len(), 2);
-    assert_eq!(incidents[0].id, "twilio:cp-test-001:upd-test-001");
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].id, "integ-test-guid-001");
     assert_eq!(incidents[0].provider, "twilio");
-    assert_eq!(incidents[0].title, "SMS Delivery Delays");
-    assert!(incidents[0].description.contains("[major] [investigating]"));
-    assert_eq!(incidents[0].link, "http://stspg.co/TEST001");
-    assert_eq!(
-        incidents[0].occurred_at,
-        "2014-05-14T14:22:39.441-06:00"
-    );
-
-    assert_eq!(incidents[1].id, "twilio:cp-test-001:upd-test-002");
-    assert!(incidents[1].description.contains("[major] [identified]"));
 }
 
 #[tokio::test]
-async fn twilio_provider_handles_empty_response() {
+async fn twilio_provider_handles_empty_feed() {
     let mock_server = MockServer::start().await;
+    let empty_feed = r#"<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Twilio Status</title>
+    <link>https://status.twilio.com</link>
+    <description>Twilio Status</description>
+  </channel>
+</rss>"#;
 
     Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"incidents":[]}"#))
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_feed))
         .mount(&mock_server)
         .await;
 
-    let provider =
-        wn_alerts::providers::twilio::TwilioProvider::new_unvalidated(mock_server.uri());
+    let provider = wn_alerts::providers::twilio::new_unvalidated(mock_server.uri());
     let client = build_client();
-
     let incidents = provider.check(&client).await.unwrap();
     assert!(incidents.is_empty());
 }
@@ -243,11 +213,9 @@ async fn twilio_provider_handles_http_error() {
         .mount(&mock_server)
         .await;
 
-    let provider =
-        wn_alerts::providers::twilio::TwilioProvider::new_unvalidated(mock_server.uri());
+    let provider = wn_alerts::providers::twilio::new_unvalidated(mock_server.uri());
     let client = build_client();
     let result = provider.check(&client).await;
-
     assert!(result.is_err());
 }
 
