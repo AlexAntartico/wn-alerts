@@ -1,0 +1,490 @@
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+use wn_alerts::notifiers::Notifier;
+use wn_alerts::StatusProvider;
+
+const RSS_ITEM_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Azure Status</title>
+    <link>https://azure.status.microsoft/en-us/status/</link>
+    <description>Azure Status</description>
+    <item>
+      <title>Azure App Service - Service Disruption</title>
+      <description>Customers may experience 503 errors in West US 2.</description>
+      <link>https://azure.status.microsoft/en-us/status/incident/int-001</link>
+      <guid isPermaLink="false">integ-test-guid-001</guid>
+      <pubDate>Wed, 20 May 2026 22:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>"#;
+
+fn build_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn azure_provider_fetches_and_parses_rss() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/status/feed/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RSS_ITEM_XML))
+        .mount(&mock_server)
+        .await;
+
+    let feed_url = format!("{}/status/feed/", mock_server.uri());
+    let provider = wn_alerts::providers::azure::new_unvalidated(feed_url);
+    let client = build_client();
+
+    let incidents = provider.check(&client).await.expect("check should succeed");
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].id, "integ-test-guid-001");
+    assert_eq!(incidents[0].provider, "azure");
+    assert_eq!(incidents[0].title, "Azure App Service - Service Disruption");
+    assert_eq!(
+        incidents[0].link,
+        "https://azure.status.microsoft/en-us/status/incident/int-001"
+    );
+}
+
+#[tokio::test]
+async fn azure_provider_handles_empty_feed() {
+    let mock_server = MockServer::start().await;
+    let empty_feed = r#"<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Azure Status</title>
+    <link>https://azure.status.microsoft/en-us/status/</link>
+    <description>Azure Status</description>
+  </channel>
+</rss>"#;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_feed))
+        .mount(&mock_server)
+        .await;
+
+    let provider = wn_alerts::providers::azure::new_unvalidated(mock_server.uri());
+    let client = build_client();
+
+    let incidents = provider.check(&client).await.unwrap();
+    assert!(incidents.is_empty());
+}
+
+#[tokio::test]
+async fn azure_provider_handles_http_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+
+    let provider = wn_alerts::providers::azure::new_unvalidated(mock_server.uri());
+    let client = build_client();
+    let result = provider.check(&client).await;
+
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn telegram_notifier_sends_message() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/bot123:test-token/sendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = reqwest::Client::new();
+    let incident = wn_alerts::Incident {
+        provider: "azure".into(),
+        id: "tg-1".into(),
+        title: "Test Incident".into(),
+        description: "Test description".into(),
+        link: "https://example.com".into(),
+        occurred_at: "Thu, 21 May 2026 12:00:00 GMT".into(),
+    };
+
+    let notifier = wn_alerts::notifiers::telegram::TelegramNotifier::new(
+        "123:test-token".into(),
+        "456".into(),
+    )
+    .with_api_url(mock_server.uri());
+
+    let result = notifier.notify(&client, &incident).await;
+    assert!(result.is_ok(), "notify failed: {:?}", result.err());
+}
+
+#[tokio::test]
+async fn telegram_notifier_handles_api_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/botbad-token/sendMessage"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string(r#"{"ok":false,"description":"Unauthorized"}"#),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let client = reqwest::Client::new();
+    let incident = wn_alerts::Incident {
+        provider: "azure".into(),
+        id: "tg-fail".into(),
+        title: "Test".into(),
+        description: "Desc".into(),
+        link: "".into(),
+        occurred_at: "Thu, 21 May 2026 12:00:00 GMT".into(),
+    };
+
+    let notifier = wn_alerts::notifiers::telegram::TelegramNotifier::new(
+        "bad-token".into(),
+        "456".into(),
+    )
+    .with_api_url(mock_server.uri());
+
+    let result = notifier.notify(&client, &incident).await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        wn_alerts::AppError::TelegramApi { status, .. } => {
+            assert_eq!(status, 401);
+        }
+        other => panic!("expected TelegramApi error, got {:?}", other),
+    }
+}
+
+const TWILIO_INCIDENTS_JSON: &str = r#"{
+  "incidents": [
+    {
+      "id": "cp-test-001",
+      "name": "SMS Delivery Delays",
+      "status": "identified",
+      "impact": "major",
+      "shortlink": "http://stspg.co/TEST001",
+      "incident_updates": [
+        {
+          "id": "upd-test-001",
+          "body": "We are investigating reports of SMS delivery delays.",
+          "status": "investigating",
+          "created_at": "2014-05-14T14:22:39.441-06:00"
+        },
+        {
+          "id": "upd-test-002",
+          "body": "Root cause identified, fix being deployed.",
+          "status": "identified",
+          "created_at": "2014-05-14T14:35:21.711-06:00"
+        }
+      ]
+    }
+  ]
+}"#;
+
+#[tokio::test]
+async fn twilio_provider_fetches_and_parses_json() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/incidents.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(TWILIO_INCIDENTS_JSON))
+        .mount(&mock_server)
+        .await;
+
+    let api_url = format!("{}/api/v2/incidents.json", mock_server.uri());
+    let provider = wn_alerts::providers::twilio::TwilioProvider::new_unvalidated(api_url);
+    let client = build_client();
+
+    let incidents = provider.check(&client).await.expect("check should succeed");
+    assert_eq!(incidents.len(), 2);
+    assert_eq!(incidents[0].id, "twilio:cp-test-001:upd-test-001");
+    assert_eq!(incidents[0].provider, "twilio");
+    assert_eq!(incidents[0].title, "SMS Delivery Delays");
+    assert!(incidents[0].description.contains("[major] [investigating]"));
+    assert_eq!(incidents[0].link, "http://stspg.co/TEST001");
+    assert_eq!(
+        incidents[0].occurred_at,
+        "2014-05-14T14:22:39.441-06:00"
+    );
+
+    assert_eq!(incidents[1].id, "twilio:cp-test-001:upd-test-002");
+    assert!(incidents[1].description.contains("[major] [identified]"));
+}
+
+#[tokio::test]
+async fn twilio_provider_handles_empty_response() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"incidents":[]}"#))
+        .mount(&mock_server)
+        .await;
+
+    let provider =
+        wn_alerts::providers::twilio::TwilioProvider::new_unvalidated(mock_server.uri());
+    let client = build_client();
+
+    let incidents = provider.check(&client).await.unwrap();
+    assert!(incidents.is_empty());
+}
+
+#[tokio::test]
+async fn twilio_provider_handles_http_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+
+    let provider =
+        wn_alerts::providers::twilio::TwilioProvider::new_unvalidated(mock_server.uri());
+    let client = build_client();
+    let result = provider.check(&client).await;
+
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn github_provider_fetches_and_parses_rss() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/history.rss"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RSS_ITEM_XML))
+        .mount(&mock_server)
+        .await;
+
+    let feed_url = format!("{}/history.rss", mock_server.uri());
+    let provider = wn_alerts::providers::github::new_unvalidated(feed_url);
+    let client = build_client();
+
+    let incidents = provider.check(&client).await.expect("check should succeed");
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].id, "integ-test-guid-001");
+    assert_eq!(incidents[0].provider, "github");
+}
+
+#[tokio::test]
+async fn github_provider_handles_empty_feed() {
+    let mock_server = MockServer::start().await;
+    let empty_feed = r#"<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>GitHub Status</title>
+    <link>https://www.githubstatus.com</link>
+    <description>GitHub Status</description>
+  </channel>
+</rss>"#;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_feed))
+        .mount(&mock_server)
+        .await;
+
+    let provider =
+        wn_alerts::providers::github::new_unvalidated(mock_server.uri());
+    let client = build_client();
+    let incidents = provider.check(&client).await.unwrap();
+    assert!(incidents.is_empty());
+}
+
+#[tokio::test]
+async fn github_provider_handles_http_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+
+    let provider =
+        wn_alerts::providers::github::new_unvalidated(mock_server.uri());
+    let client = build_client();
+    let result = provider.check(&client).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn cloudflare_provider_fetches_and_parses_rss() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/history.rss"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RSS_ITEM_XML))
+        .mount(&mock_server)
+        .await;
+
+    let feed_url = format!("{}/history.rss", mock_server.uri());
+    let provider = wn_alerts::providers::cloudflare::new_unvalidated(feed_url);
+    let client = build_client();
+
+    let incidents = provider.check(&client).await.expect("check should succeed");
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].id, "integ-test-guid-001");
+    assert_eq!(incidents[0].provider, "cloudflare");
+}
+
+#[tokio::test]
+async fn cloudflare_provider_handles_empty_feed() {
+    let mock_server = MockServer::start().await;
+    let empty_feed = r#"<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Cloudflare Status</title>
+    <link>https://www.cloudflarestatus.com</link>
+    <description>Cloudflare Status</description>
+  </channel>
+</rss>"#;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_feed))
+        .mount(&mock_server)
+        .await;
+
+    let provider =
+        wn_alerts::providers::cloudflare::new_unvalidated(mock_server.uri());
+    let client = build_client();
+    let incidents = provider.check(&client).await.unwrap();
+    assert!(incidents.is_empty());
+}
+
+#[tokio::test]
+async fn cloudflare_provider_handles_http_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+
+    let provider =
+        wn_alerts::providers::cloudflare::new_unvalidated(mock_server.uri());
+    let client = build_client();
+    let result = provider.check(&client).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn aws_provider_fetches_and_parses_rss() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/rss/all.rss"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RSS_ITEM_XML))
+        .mount(&mock_server)
+        .await;
+
+    let feed_url = format!("{}/rss/all.rss", mock_server.uri());
+    let provider = wn_alerts::providers::aws::new_unvalidated(feed_url);
+    let client = build_client();
+
+    let incidents = provider.check(&client).await.expect("check should succeed");
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].id, "integ-test-guid-001");
+    assert_eq!(incidents[0].provider, "aws");
+}
+
+#[tokio::test]
+async fn aws_provider_handles_empty_feed() {
+    let mock_server = MockServer::start().await;
+    let empty_feed = r#"<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>AWS Service Status</title>
+    <link>https://status.aws.amazon.com</link>
+    <description>AWS Service Status</description>
+  </channel>
+</rss>"#;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_feed))
+        .mount(&mock_server)
+        .await;
+
+    let provider = wn_alerts::providers::aws::new_unvalidated(mock_server.uri());
+    let client = build_client();
+    let incidents = provider.check(&client).await.unwrap();
+    assert!(incidents.is_empty());
+}
+
+#[tokio::test]
+async fn aws_provider_handles_http_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+
+    let provider = wn_alerts::providers::aws::new_unvalidated(mock_server.uri());
+    let client = build_client();
+    let result = provider.check(&client).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn airship_provider_fetches_and_parses_rss() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/rss"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RSS_ITEM_XML))
+        .mount(&mock_server)
+        .await;
+
+    let feed_url = format!("{}/rss", mock_server.uri());
+    let provider = wn_alerts::providers::airship::new_unvalidated(feed_url);
+    let client = build_client();
+
+    let incidents = provider.check(&client).await.expect("check should succeed");
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].id, "integ-test-guid-001");
+    assert_eq!(incidents[0].provider, "airship");
+}
+
+#[tokio::test]
+async fn airship_provider_handles_empty_feed() {
+    let mock_server = MockServer::start().await;
+    let empty_feed = r#"<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Airship Status</title>
+    <link>https://status.airship.com</link>
+    <description>Airship Status</description>
+  </channel>
+</rss>"#;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_feed))
+        .mount(&mock_server)
+        .await;
+
+    let provider =
+        wn_alerts::providers::airship::new_unvalidated(mock_server.uri());
+    let client = build_client();
+    let incidents = provider.check(&client).await.unwrap();
+    assert!(incidents.is_empty());
+}
+
+#[tokio::test]
+async fn airship_provider_handles_http_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+
+    let provider =
+        wn_alerts::providers::airship::new_unvalidated(mock_server.uri());
+    let client = build_client();
+    let result = provider.check(&client).await;
+    assert!(result.is_err());
+}
