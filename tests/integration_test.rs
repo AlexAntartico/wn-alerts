@@ -456,3 +456,61 @@ async fn airship_provider_handles_http_error() {
     let result = provider.check(&client).await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn imperva_provider_fetches_and_parses_rss() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/history.rss"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RSS_ITEM_XML))
+        .mount(&mock_server)
+        .await;
+
+    let feed_url = format!("{}/history.rss", mock_server.uri());
+    let provider = wn_alerts::providers::imperva::new_unvalidated(feed_url);
+    let client = build_client();
+
+    let incidents = provider.check(&client).await.expect("check should succeed");
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].id, "integ-test-guid-001");
+    assert_eq!(incidents[0].provider, "imperva");
+}
+
+#[tokio::test]
+async fn imperva_provider_handles_empty_feed() {
+    let mock_server = MockServer::start().await;
+    let empty_feed = r#"<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Imperva Status</title>
+    <link>https://status.imperva.com</link>
+    <description>Imperva Status</description>
+  </channel>
+</rss>"#;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_feed))
+        .mount(&mock_server)
+        .await;
+
+    let provider = wn_alerts::providers::imperva::new_unvalidated(mock_server.uri());
+    let client = build_client();
+    let incidents = provider.check(&client).await.unwrap();
+    assert!(incidents.is_empty());
+}
+
+#[tokio::test]
+async fn imperva_provider_handles_http_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+
+    let provider = wn_alerts::providers::imperva::new_unvalidated(mock_server.uri());
+    let client = build_client();
+    let result = provider.check(&client).await;
+    assert!(result.is_err());
+}

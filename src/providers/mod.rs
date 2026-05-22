@@ -2,10 +2,10 @@ pub mod airship;
 pub mod aws;
 pub mod azure;
 pub mod cloudflare;
-pub mod f5;
+// pub mod f5;
 pub mod github;
 pub mod imperva;
-pub mod okta;
+// pub mod okta;
 pub mod rss_common;
 pub mod twilio;
 
@@ -55,21 +55,21 @@ fn build_one(name: &str, _config: &Config) -> Result<Box<dyn StatusProvider>, Ap
                 .unwrap_or_else(|| "https://www.githubstatus.com/history.rss".into());
             Ok(Box::new(github::new(feed_url)))
         }
-        "okta" => {
-            let feed_url = crate::config::provider_param("okta", "FEED_URL")
-                .unwrap_or_else(|| "https://status.okta.com/history.rss".into());
-            Ok(Box::new(okta::new(feed_url)))
-        }
+        // "okta" => {
+        //     let feed_url = crate::config::provider_param("okta", "FEED_URL")
+        //         .unwrap_or_else(|| "https://status.okta.com/history.rss".into());
+        //     Ok(Box::new(okta::new(feed_url)))
+        // }
         "imperva" => {
             let feed_url = crate::config::provider_param("imperva", "FEED_URL")
                 .unwrap_or_else(|| "https://status.imperva.com/history.rss".into());
             Ok(Box::new(imperva::new(feed_url)))
         }
-        "f5" => {
-            let feed_url = crate::config::provider_param("f5", "FEED_URL")
-                .unwrap_or_else(|| "https://status.f5.com/history.rss".into());
-            Ok(Box::new(f5::new(feed_url)))
-        }
+        // "f5" => {
+        //     let feed_url = crate::config::provider_param("f5", "FEED_URL")
+        //         .unwrap_or_else(|| "https://status.f5.com/history.rss".into());
+        //     Ok(Box::new(f5::new(feed_url)))
+        // }
         unknown => Err(AppError::UnknownProvider(unknown.to_string())),
     }
 }

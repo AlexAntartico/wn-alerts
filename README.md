@@ -293,3 +293,10 @@ cargo test
 ```
 
 106 tests: 86 unit (providers, notifiers, state, config, HTML utils) + 20 integration (wiremock-based HTTP tests).
+
+# To do:
+[] Okta is requesting auth
+[] f5 domain is gone, need to check in statuspage.io
+[] check the status_200 tests are working
+
+For now okta and f5 remain disabled
