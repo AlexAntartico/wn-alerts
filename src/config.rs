@@ -132,6 +132,7 @@ impl Config {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
             .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| AppError::ClientInit(e.to_string()))
     }

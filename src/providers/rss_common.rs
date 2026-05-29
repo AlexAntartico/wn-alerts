@@ -120,6 +120,18 @@ impl StatusProvider for RssProvider {
             .send()
             .await?
             .error_for_status()?;
+
+        if response.status().is_redirection() {
+            return Err(AppError::InvalidConfig {
+                key: self.config_key,
+                value: format!(
+                    "{} returned {} — redirects are not followed",
+                    self.feed_url,
+                    response.status()
+                ),
+            });
+        }
+
         let bytes = response.bytes().await?;
         rss_parser::parse_incidents_from_bytes(&bytes, self.name)
     }
