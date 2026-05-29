@@ -616,3 +616,61 @@ async fn rss_provider_rejects_redirect_response() {
         other => panic!("expected InvalidConfig, got {:?}", other),
     }
 }
+
+#[tokio::test]
+async fn providers_poll_concurrently_not_sequentially() {
+    use std::time::Instant;
+
+    let server_a = MockServer::start().await;
+    let server_b = MockServer::start().await;
+
+    // Each mock responds after 300ms delay
+    let empty_rss = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>T</title></channel></rss>"#;
+
+    Mock::given(wiremock::matchers::method("GET"))
+        .and(path("/slow.rss"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(empty_rss)
+                .set_delay(std::time::Duration::from_millis(300)),
+        )
+        .mount(&server_a)
+        .await;
+
+    Mock::given(wiremock::matchers::method("GET"))
+        .and(path("/slow.rss"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(empty_rss)
+                .set_delay(std::time::Duration::from_millis(300)),
+        )
+        .mount(&server_b)
+        .await;
+
+    // Build two providers pointing at different mock servers
+    let p1 = wn_alerts::providers::azure::new_unvalidated(format!("{}/slow.rss", server_a.uri()));
+    let p2 = wn_alerts::providers::aws::new_unvalidated(format!("{}/slow.rss", server_b.uri()));
+    let client = wn_alerts::config::ConfigBuilder::new()
+        .build()
+        .unwrap()
+        .build_client()
+        .unwrap();
+
+    let start = Instant::now();
+
+    // Concurrent fan-out (simulating the scheduler's behavior)
+    let (r1, r2) = tokio::join!(p1.check(&client), p2.check(&client));
+
+    let elapsed = start.elapsed();
+
+    assert!(r1.is_ok(), "provider 1 should succeed");
+    assert!(r2.is_ok(), "provider 2 should succeed");
+
+    // Concurrent: ~300ms. Sequential: ~600ms.
+    // Use 450ms as threshold to account for overhead while still proving concurrency.
+    assert!(
+        elapsed < std::time::Duration::from_millis(450),
+        "polling was sequential (took {:?}, expected <450ms for 2x300ms concurrent)",
+        elapsed,
+    );
+}

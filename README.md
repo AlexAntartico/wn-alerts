@@ -14,8 +14,8 @@ cargo run --release
 
 The daemon runs a poll loop every N minutes (default 5). Each tick:
 
-1. Every enabled **provider** is queried for active incidents
-2. New incidents (not previously seen) are routed to every enabled **notifier**
+1. **Fan-out phase**: All enabled providers are queried **concurrently** via `tokio::spawn` — a slow or unreachable provider doesn't block others. Wall-clock tick time is `max(provider_times)` instead of `sum(provider_times)`. For 7 providers at 30s timeout each, that's **30 seconds max** instead of 3.5 minutes.
+2. **Fan-in phase**: Results are processed sequentially — new incidents (not previously seen) are routed to every enabled notifier, and marked seen in state
 3. Each incident is marked seen immediately after notification, regardless of notification success — failed notifications are logged but do not block the cycle
 4. Seen incident IDs are persisted to `state.json` after every cycle so alerts only fire once per incident
 
@@ -31,7 +31,7 @@ src/
 │   ├── provider.rs             # StatusProvider trait (name + async check)
 │   ├── incident.rs             # Normalized Incident model
 │   ├── state.rs                # Per-provider seen-ID tracking (JSON persistence)
-│   └── scheduler.rs            # Poll loop — orchestrates all providers + notifiers
+│   └── scheduler.rs            # Poll loop — concurrent fan-out/fan-in orchestration
 │
 ├── providers/                  # One module per service
 │   ├── mod.rs                  # Factory — maps config names → concrete providers
@@ -293,7 +293,20 @@ Add the provider to these README sections:
 cargo test
 ```
 
-113 tests: 87 unit (providers, notifiers, state, config, HTML utils) + 26 integration (wiremock-based HTTP tests).
+118 tests: 91 unit (providers, notifiers, state, config, HTML utils, scheduler concurrency) + 27 integration (wiremock-based HTTP tests).
+
+### Concurrency tests
+
+The scheduler's concurrent polling is verified by tests that measure wall-clock time:
+
+```rust
+// 2 providers, each with 200ms mock delay → should complete in ~200ms (concurrent)
+// not ~400ms (sequential)
+#[tokio::test]
+async fn fetch_all_providers_concurrently_is_actually_concurrent() { ... }
+```
+
+Run with: `cargo test --lib core::scheduler::tests`
 
 ## Security
 
@@ -303,6 +316,7 @@ cargo test
 - Secret handling: bot tokens redacted from logs and error messages, state files 0o600 permissions
 - Bounded resource usage: config validation, state ID caps (10k/provider), graceful shutdown
 - XML parsing safety: quick-xml with no external entity processing
+- Concurrent polling safety: providers wrapped in `Arc<dyn StatusProvider>` for thread-safe sharing across spawned tasks
 
 # To do:
 [] Okta is requesting auth

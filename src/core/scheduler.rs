@@ -5,12 +5,19 @@ use crate::core::state::AppState;
 use crate::error::AppError;
 use crate::notifiers::Notifier;
 use chrono::Utc;
+use std::sync::Arc;
+
+/// Result of a single provider check, collected during fan-in phase.
+struct ProviderCheckResult {
+    name: &'static str,
+    result: Result<Vec<Incident>, AppError>,
+}
 
 pub struct Scheduler {
     config: Config,
     state: AppState,
     client: reqwest::Client,
-    providers: Vec<Box<dyn StatusProvider>>,
+    providers: Vec<Arc<dyn StatusProvider>>,
     notifiers: Vec<Box<dyn Notifier>>,
 }
 
@@ -19,16 +26,22 @@ impl Scheduler {
         let client = config.build_client()?;
         let state = crate::core::state::load_state(&config.state_file_path)?;
 
-        let providers = crate::providers::build_all(&config)?;
+        let boxed_providers = crate::providers::build_all(&config)?;
         let notifiers = crate::notifiers::build_all(&config)?;
 
-        if providers.is_empty() {
+        if boxed_providers.is_empty() {
             return Err(AppError::NoProvidersEnabled);
         }
 
         if notifiers.is_empty() {
             return Err(AppError::NoNotifiersEnabled);
         }
+
+        // Convert Box<dyn StatusProvider> to Arc<dyn StatusProvider> for concurrent polling
+        let providers: Vec<Arc<dyn StatusProvider>> = boxed_providers
+            .into_iter()
+            .map(|b| Arc::from(b) as Arc<dyn StatusProvider>)
+            .collect();
 
         Ok(Self {
             config,
@@ -63,13 +76,12 @@ impl Scheduler {
         let now = Utc::now();
         tracing::info!("--- Poll cycle start ---");
 
-        self.providers.iter().for_each(|provider| {
-            tracing::info!(provider = provider.name(), "Checking status...");
-        });
+        // Phase 1: Fan-out — poll all providers concurrently
+        let results = self.fetch_all_providers_concurrently().await;
 
-        let provider_count = self.providers.len();
-        for i in 0..provider_count {
-            self.process_provider_by_index(i, &now).await;
+        // Phase 2: Fan-in — process results sequentially (state mutation is fast)
+        for result in results {
+            self.process_provider_result(result, &now).await;
         }
 
         if let Err(e) = crate::core::state::save_state(&self.config.state_file_path, &self.state) {
@@ -79,11 +91,45 @@ impl Scheduler {
         tracing::info!("--- Poll cycle complete ---");
     }
 
-    async fn process_provider_by_index(&mut self, index: usize, now: &chrono::DateTime<Utc>) {
-        let provider = &self.providers[index];
-        let name = provider.name();
+    /// Fan-out: spawn concurrent HTTP requests to all providers.
+    /// Returns collected results in completion order.
+    async fn fetch_all_providers_concurrently(&self) -> Vec<ProviderCheckResult> {
+        let mut handles = Vec::with_capacity(self.providers.len());
 
-        match provider.check(&self.client).await {
+        for provider in &self.providers {
+            let provider = Arc::clone(provider);
+            let client = self.client.clone();
+
+            let handle = tokio::spawn(async move {
+                let name = provider.name();
+                tracing::info!(provider = name, "Checking status...");
+                let result = provider.check(&client).await;
+                ProviderCheckResult { name, result }
+            });
+
+            handles.push(handle);
+        }
+
+        // Collect results from all spawned tasks
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.await {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    // Task panicked or was cancelled — log but don't fail the cycle
+                    tracing::error!(error = %e, "Provider task panicked or was cancelled");
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Fan-in: process a single provider's result, updating state and sending notifications.
+    async fn process_provider_result(&mut self, check: ProviderCheckResult, now: &chrono::DateTime<Utc>) {
+        let name = check.name;
+
+        match check.result {
             Ok(incidents) => {
                 tracing::info!(
                     provider = name,
@@ -259,6 +305,218 @@ mod tests {
             Scheduler::new(config),
             "UnknownNotifier",
             |e| matches!(e, AppError::UnknownNotifier(_)),
+        );
+    }
+
+    /// Helper to create a scheduler for testing concurrent polling
+    /// with pre-built providers (allows using new_unvalidated for mock servers)
+    fn create_test_scheduler_with_providers(
+        config: Config,
+        providers: Vec<Box<dyn StatusProvider>>,
+    ) -> Scheduler {
+        use async_trait::async_trait;
+
+        struct NoopNotifier;
+
+        #[async_trait]
+        impl crate::notifiers::Notifier for NoopNotifier {
+            fn name(&self) -> &'static str {
+                "noop"
+            }
+            async fn notify(
+                &self,
+                _client: &reqwest::Client,
+                _incident: &Incident,
+            ) -> Result<(), AppError> {
+                Ok(())
+            }
+        }
+
+        let client = config.build_client().unwrap();
+        let state = crate::core::state::load_state(&config.state_file_path).unwrap();
+
+        let arc_providers: Vec<Arc<dyn StatusProvider>> = providers
+            .into_iter()
+            .map(|b| Arc::from(b) as Arc<dyn StatusProvider>)
+            .collect();
+
+        Scheduler {
+            config,
+            state,
+            client,
+            providers: arc_providers,
+            notifiers: vec![Box::new(NoopNotifier)],
+        }
+    }
+
+    #[test]
+    fn providers_wrapped_in_arc() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = ConfigBuilder::new()
+            .providers(vec!["azure".into(), "aws".into()])
+            .notifiers(vec![])
+            .state_file(state_path(&tmp))
+            .build()
+            .unwrap();
+
+        // Build providers with default URLs (they won't be called, just checked for structure)
+        let providers = crate::providers::build_all(&config).unwrap();
+        let scheduler = create_test_scheduler_with_providers(config, providers);
+
+        // Verify providers are stored as Arc (can be cloned and shared)
+        assert_eq!(scheduler.providers.len(), 2);
+        assert_eq!(scheduler.providers[0].name(), "azure");
+        assert_eq!(scheduler.providers[1].name(), "aws");
+
+        // Verify Arc reference counting works (clone should succeed)
+        let _arc_clone = Arc::clone(&scheduler.providers[0]);
+    }
+
+    #[tokio::test]
+    async fn fetch_all_providers_concurrently_returns_all_results() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mock_server = MockServer::start().await;
+
+        let empty_rss = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>T</title></channel></rss>"#;
+
+        Mock::given(method("GET"))
+            .and(path("/feed.rss"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(empty_rss))
+            .mount(&mock_server)
+            .await;
+
+        let feed_url = format!("{}/feed.rss", mock_server.uri());
+
+        // Use new_unvalidated to skip domain validation for mock server
+        let providers: Vec<Box<dyn StatusProvider>> = vec![
+            Box::new(crate::providers::azure::new_unvalidated(feed_url.clone())),
+            Box::new(crate::providers::aws::new_unvalidated(feed_url)),
+        ];
+
+        let config = ConfigBuilder::new()
+            .providers(vec![])
+            .notifiers(vec![])
+            .state_file(state_path(&tmp))
+            .build()
+            .unwrap();
+
+        let scheduler = create_test_scheduler_with_providers(config, providers);
+        let results = scheduler.fetch_all_providers_concurrently().await;
+
+        // Should get results from both providers
+        assert_eq!(results.len(), 2);
+
+        // Both should succeed (empty feeds)
+        assert!(results.iter().all(|r| r.result.is_ok()));
+
+        // Check provider names are captured
+        let names: Vec<&str> = results.iter().map(|r| r.name).collect();
+        assert!(names.contains(&"azure"));
+        assert!(names.contains(&"aws"));
+    }
+
+    #[tokio::test]
+    async fn fetch_all_providers_concurrently_handles_provider_errors() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mock_server = MockServer::start().await;
+
+        // Return 500 error to trigger provider check failure
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let feed_url = mock_server.uri();
+
+        let providers: Vec<Box<dyn StatusProvider>> = vec![
+            Box::new(crate::providers::azure::new_unvalidated(feed_url)),
+        ];
+
+        let config = ConfigBuilder::new()
+            .providers(vec![])
+            .notifiers(vec![])
+            .state_file(state_path(&tmp))
+            .build()
+            .unwrap();
+
+        let scheduler = create_test_scheduler_with_providers(config, providers);
+        let results = scheduler.fetch_all_providers_concurrently().await;
+
+        // Should get result even on error
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "azure");
+        assert!(results[0].result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_all_providers_concurrently_is_actually_concurrent() {
+        use std::time::Instant;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server_a = MockServer::start().await;
+        let server_b = MockServer::start().await;
+
+        let empty_rss = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>T</title></channel></rss>"#;
+
+        // Each mock responds after 200ms delay
+        Mock::given(method("GET"))
+            .and(path("/slow.rss"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(empty_rss)
+                    .set_delay(std::time::Duration::from_millis(200)),
+            )
+            .mount(&server_a)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/slow.rss"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(empty_rss)
+                    .set_delay(std::time::Duration::from_millis(200)),
+            )
+            .mount(&server_b)
+            .await;
+
+        let feed_url_a = format!("{}/slow.rss", server_a.uri());
+        let feed_url_b = format!("{}/slow.rss", server_b.uri());
+
+        let providers: Vec<Box<dyn StatusProvider>> = vec![
+            Box::new(crate::providers::azure::new_unvalidated(feed_url_a)),
+            Box::new(crate::providers::aws::new_unvalidated(feed_url_b)),
+        ];
+
+        let config = ConfigBuilder::new()
+            .providers(vec![])
+            .notifiers(vec![])
+            .state_file(state_path(&tmp))
+            .build()
+            .unwrap();
+
+        let scheduler = create_test_scheduler_with_providers(config, providers);
+
+        let start = Instant::now();
+        let results = scheduler.fetch_all_providers_concurrently().await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.result.is_ok()));
+
+        // Concurrent: ~200ms. Sequential: ~400ms.
+        // Use 350ms as threshold to account for overhead while still proving concurrency.
+        assert!(
+            elapsed < std::time::Duration::from_millis(350),
+            "polling was sequential (took {:?}, expected <350ms for 2x200ms concurrent)",
+            elapsed,
         );
     }
 }
