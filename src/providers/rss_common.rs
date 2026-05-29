@@ -5,6 +5,8 @@ use crate::core::incident::Incident;
 use crate::core::provider::StatusProvider;
 use crate::error::AppError;
 
+pub const MAX_FEED_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+
 pub struct RssProvider {
     name: &'static str,
     feed_url: String,
@@ -132,7 +134,25 @@ impl StatusProvider for RssProvider {
             });
         }
 
+        if response.content_length().unwrap_or(0) as usize > MAX_FEED_SIZE {
+            return Err(AppError::InvalidConfig {
+                key: self.config_key,
+                value: format!(
+                    "{} response too large: {} bytes",
+                    self.feed_url,
+                    response.content_length().unwrap_or(0)
+                ),
+            });
+        }
+
         let bytes = response.bytes().await?;
+        if bytes.len() > MAX_FEED_SIZE {
+            return Err(AppError::InvalidConfig {
+                key: self.config_key,
+                value: format!("{} response too large: {} bytes", self.feed_url, bytes.len()),
+            });
+        }
+
         rss_parser::parse_incidents_from_bytes(&bytes, self.name)
     }
 }
