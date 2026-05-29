@@ -21,6 +21,27 @@ The daemon runs a poll loop every N minutes (default 5). Each tick:
 
 SIGINT (Ctrl+C) triggers a graceful shutdown with state save.
 
+```bash
+May 29 12:33:51 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:51.533707Z  INFO wn_alerts::core::scheduler: --- Poll cycle start ---
+May 29 12:33:51 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:51.535575Z  INFO wn_alerts::core::scheduler: Checking status... provider="azure"
+May 29 12:33:51 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:51.535777Z  INFO wn_alerts::core::scheduler: Checking status... provider="aws"
+May 29 12:33:51 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:51.535862Z  INFO wn_alerts::core::scheduler: Checking status... provider="cloudflare"
+May 29 12:33:51 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:51.535945Z  INFO wn_alerts::core::scheduler: Checking status... provider="twilio"
+May 29 12:33:51 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:51.536022Z  INFO wn_alerts::core::scheduler: Checking status... provider="imperva"
+May 29 12:33:51 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:51.536089Z  INFO wn_alerts::core::scheduler: Checking status... provider="airship"
+May 29 12:33:51 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:51.536153Z  INFO wn_alerts::core::scheduler: Checking status... provider="github"
+May 29 12:33:52 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:52.105533Z  INFO wn_alerts::core::scheduler: Fetched 47 incident(s) provider="airship" total=47
+May 29 12:33:52 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:52.105982Z  INFO wn_alerts::core::scheduler: Fetched 36 incident(s) provider="aws" total=36
+May 29 12:33:52 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:52.106048Z  INFO wn_alerts::core::scheduler: Fetched 2 incident(s) provider="azure" total=2
+May 29 12:33:52 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:52.106058Z  INFO wn_alerts::core::scheduler: New incident detected provider="azure" id=active-azure-openai-service-elevated-error-rates-in-multiple-regions title=Active - Azure OpenAI Service Elevated Error Rates in multiple regions
+May 29 12:33:53 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:53.505374Z  INFO wn_alerts::core::scheduler: Notification sent notifier="telegram" provider=azure
+May 29 12:33:53 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:53.506106Z  INFO wn_alerts::core::scheduler: Fetched 25 incident(s) provider="cloudflare" total=25
+May 29 12:33:53 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:53.506193Z  INFO wn_alerts::core::scheduler: Fetched 25 incident(s) provider="github" total=25
+May 29 12:33:53 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:53.506235Z  INFO wn_alerts::core::scheduler: Fetched 25 incident(s) provider="imperva" total=25
+May 29 12:33:53 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:53.506295Z  INFO wn_alerts::core::scheduler: Fetched 25 incident(s) provider="twilio" total=25
+May 29 12:33:53 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:53.506822Z  INFO wn_alerts::core::scheduler: --- Poll cycle complete ---
+```
+
 > **Note on `state.json` growth:** seen IDs are capped at 10,000 entries per provider (FIFO eviction). In practice this is several years of incidents and the file stays small. If you redeploy with a fresh `state.json` (or delete it) you will receive alerts for any incidents currently active in the feeds. To reset quietly, clear the file after a period of no active incidents.
 
 ## Architecture
@@ -120,6 +141,11 @@ Provider-specific config follows the pattern `PROVIDER_{NAME}_{KEY}`.
 | `NOTIFIER_TELEGRAM_CHAT_ID` | yes | Target chat ID |
 
 Notifier-specific config follows the pattern `NOTIFIER_{NAME}_{KEY}`.
+
+**Telegram Notification**
+
+<img width="415" height="415" alt="image" src="https://github.com/user-attachments/assets/9d23ffe1-91ed-4989-ac59-3307ab6b579e" />
+
 
 ### Example `.env`
 
