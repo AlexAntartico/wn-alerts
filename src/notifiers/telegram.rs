@@ -101,8 +101,8 @@ pub fn format_message(incident: &Incident) -> String {
     let title_escaped = html::escape_html(&incident.title);
     let date_escaped = html::escape_html(&formatted_date);
     let link_escaped = html::escape_html(&incident.link);
-    let desc_decoded = html::decode_html_entities(&incident.description);
-    let desc_escaped = html::escape_html(&desc_decoded);
+    let desc_plain = html::strip_html_tags(&incident.description);
+    let desc_escaped = html::escape_html(&desc_plain);
     let provider_label = html::escape_html(&incident.provider);
 
     format!(
@@ -149,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn escapes_html_in_description() {
+    fn strips_html_tags_from_description() {
         let incident = make_incident(
             "azure",
             "Test",
@@ -159,8 +159,26 @@ mod tests {
         );
         let msg = format_message(&incident);
 
-        assert!(msg.contains("&lt;b&gt;bold&lt;/b&gt; &amp; &lt;i&gt;italic&lt;/i&gt;"));
+        // Tags are stripped; entity is decoded then re-escaped for Telegram HTML mode
+        assert!(msg.contains("bold &amp; italic"));
+        // The raw description tags must not survive into the message body
         assert!(!msg.contains("<b>bold</b>"));
+        assert!(!msg.contains("<i>italic</i>"));
+    }
+
+    #[test]
+    fn strips_twilio_style_html() {
+        let desc = "<p><strong>SCHEDULED EVENT</strong></p> \
+                    <p><small>May 28</small><br> \
+                    <strong>Scheduled</strong> - Maintenance window.</p>";
+        let incident = make_incident("twilio", "Maintenance", desc, "https://x.com", "");
+        let msg = format_message(&incident);
+
+        assert!(msg.contains("SCHEDULED EVENT"));
+        assert!(msg.contains("Maintenance window."));
+        assert!(!msg.contains("<p>"));
+        assert!(!msg.contains("<strong>"));
+        assert!(!msg.contains("<var"));
     }
 
     #[test]
