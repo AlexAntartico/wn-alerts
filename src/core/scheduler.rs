@@ -92,36 +92,43 @@ impl Scheduler {
     }
 
     /// Fan-out: spawn concurrent HTTP requests to all providers.
-    /// Returns collected results in completion order.
+    /// Returns collected results sorted alphabetically by provider name.
     async fn fetch_all_providers_concurrently(&self) -> Vec<ProviderCheckResult> {
-        let mut handles = Vec::with_capacity(self.providers.len());
+        let mut handles: Vec<(&'static str, tokio::task::JoinHandle<ProviderCheckResult>)> =
+            Vec::with_capacity(self.providers.len());
 
         for provider in &self.providers {
             let provider = Arc::clone(provider);
             let client = self.client.clone();
+            let name = provider.name(); // capture before spawn
 
             let handle = tokio::spawn(async move {
-                let name = provider.name();
                 tracing::info!(provider = name, "Checking status...");
                 let result = provider.check(&client).await;
                 ProviderCheckResult { name, result }
             });
 
-            handles.push(handle);
+            handles.push((name, handle));
         }
 
         // Collect results from all spawned tasks
         let mut results = Vec::with_capacity(handles.len());
-        for handle in handles {
+        for (name, handle) in handles {
             match handle.await {
                 Ok(result) => results.push(result),
                 Err(e) => {
-                    // Task panicked or was cancelled — log but don't fail the cycle
-                    tracing::error!(error = %e, "Provider task panicked or was cancelled");
+                    // Task panicked or was cancelled — log with provider identity
+                    tracing::error!(
+                        provider = name,
+                        error = %e,
+                        "Provider task panicked or was cancelled",
+                    );
                 }
             }
         }
 
+        // Sort by provider name for deterministic ordering
+        results.sort_by_key(|r| r.name);
         results
     }
 
@@ -182,6 +189,8 @@ impl Scheduler {
                     error = %e,
                     "Provider check failed",
                 );
+                // Still record the poll time — "we tried at this time" is useful state
+                self.state.set_poll_time(name, now.to_rfc3339());
             }
         }
     }
@@ -220,6 +229,47 @@ impl Scheduler {
             "Polling every {} minutes",
             self.config.poll_interval_minutes,
         );
+    }
+}
+
+#[cfg(test)]
+impl Scheduler {
+    /// Create a scheduler for testing with pre-built providers.
+    /// Uses a noop notifier and bypasses the normal provider building.
+    pub fn new_for_test(config: Config, providers: Vec<Box<dyn StatusProvider>>) -> Self {
+        use async_trait::async_trait;
+
+        struct NoopNotifier;
+
+        #[async_trait]
+        impl crate::notifiers::Notifier for NoopNotifier {
+            fn name(&self) -> &'static str {
+                "noop"
+            }
+            async fn notify(
+                &self,
+                _client: &reqwest::Client,
+                _incident: &Incident,
+            ) -> Result<(), AppError> {
+                Ok(())
+            }
+        }
+
+        let client = config.build_client().unwrap();
+        let state = crate::core::state::load_state(&config.state_file_path).unwrap();
+
+        let arc_providers: Vec<Arc<dyn StatusProvider>> = providers
+            .into_iter()
+            .map(|b| Arc::from(b) as Arc<dyn StatusProvider>)
+            .collect();
+
+        Scheduler {
+            config,
+            state,
+            client,
+            providers: arc_providers,
+            notifiers: vec![Box::new(NoopNotifier)],
+        }
     }
 }
 
@@ -308,47 +358,6 @@ mod tests {
         );
     }
 
-    /// Helper to create a scheduler for testing concurrent polling
-    /// with pre-built providers (allows using new_unvalidated for mock servers)
-    fn create_test_scheduler_with_providers(
-        config: Config,
-        providers: Vec<Box<dyn StatusProvider>>,
-    ) -> Scheduler {
-        use async_trait::async_trait;
-
-        struct NoopNotifier;
-
-        #[async_trait]
-        impl crate::notifiers::Notifier for NoopNotifier {
-            fn name(&self) -> &'static str {
-                "noop"
-            }
-            async fn notify(
-                &self,
-                _client: &reqwest::Client,
-                _incident: &Incident,
-            ) -> Result<(), AppError> {
-                Ok(())
-            }
-        }
-
-        let client = config.build_client().unwrap();
-        let state = crate::core::state::load_state(&config.state_file_path).unwrap();
-
-        let arc_providers: Vec<Arc<dyn StatusProvider>> = providers
-            .into_iter()
-            .map(|b| Arc::from(b) as Arc<dyn StatusProvider>)
-            .collect();
-
-        Scheduler {
-            config,
-            state,
-            client,
-            providers: arc_providers,
-            notifiers: vec![Box::new(NoopNotifier)],
-        }
-    }
-
     #[test]
     fn providers_wrapped_in_arc() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -361,7 +370,7 @@ mod tests {
 
         // Build providers with default URLs (they won't be called, just checked for structure)
         let providers = crate::providers::build_all(&config).unwrap();
-        let scheduler = create_test_scheduler_with_providers(config, providers);
+        let scheduler = Scheduler::new_for_test(config, providers);
 
         // Verify providers are stored as Arc (can be cloned and shared)
         assert_eq!(scheduler.providers.len(), 2);
@@ -403,7 +412,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let scheduler = create_test_scheduler_with_providers(config, providers);
+        let scheduler = Scheduler::new_for_test(config, providers);
         let results = scheduler.fetch_all_providers_concurrently().await;
 
         // Should get results from both providers
@@ -412,10 +421,9 @@ mod tests {
         // Both should succeed (empty feeds)
         assert!(results.iter().all(|r| r.result.is_ok()));
 
-        // Check provider names are captured
-        let names: Vec<&str> = results.iter().map(|r| r.name).collect();
-        assert!(names.contains(&"azure"));
-        assert!(names.contains(&"aws"));
+        // Results are sorted alphabetically by provider name
+        assert_eq!(results[0].name, "aws");
+        assert_eq!(results[1].name, "azure");
     }
 
     #[tokio::test]
@@ -445,7 +453,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let scheduler = create_test_scheduler_with_providers(config, providers);
+        let scheduler = Scheduler::new_for_test(config, providers);
         let results = scheduler.fetch_all_providers_concurrently().await;
 
         // Should get result even on error
@@ -502,7 +510,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let scheduler = create_test_scheduler_with_providers(config, providers);
+        let scheduler = Scheduler::new_for_test(config, providers);
 
         let start = Instant::now();
         let results = scheduler.fetch_all_providers_concurrently().await;
@@ -518,5 +526,110 @@ mod tests {
             "polling was sequential (took {:?}, expected <350ms for 2x200ms concurrent)",
             elapsed,
         );
+    }
+
+    #[tokio::test]
+    async fn process_provider_result_sets_poll_time_on_error() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mock_server = MockServer::start().await;
+
+        // Return 500 error to trigger provider check failure
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let feed_url = mock_server.uri();
+
+        let providers: Vec<Box<dyn StatusProvider>> = vec![
+            Box::new(crate::providers::azure::new_unvalidated(feed_url)),
+        ];
+
+        let config = ConfigBuilder::new()
+            .providers(vec![])
+            .notifiers(vec![])
+            .state_file(state_path(&tmp))
+            .build()
+            .unwrap();
+
+        let mut scheduler = Scheduler::new_for_test(config, providers);
+        let results = scheduler.fetch_all_providers_concurrently().await;
+
+        // Process the error result
+        let now = Utc::now();
+        for result in results {
+            scheduler.process_provider_result(result, &now).await;
+        }
+
+        // Verify set_poll_time was called even on error
+        let provider_state = scheduler.state.providers.get("azure");
+        assert!(
+            provider_state.is_some(),
+            "provider state should exist after error"
+        );
+        assert!(
+            provider_state.unwrap().last_poll.is_some(),
+            "last_poll should be set even on error"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_all_providers_concurrently_returns_deterministic_order() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server_fast = MockServer::start().await;
+        let server_slow = MockServer::start().await;
+
+        let empty_rss = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>T</title></channel></rss>"#;
+
+        // "twilio" (alphabetically later) responds fast
+        Mock::given(method("GET"))
+            .and(path("/fast.rss"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(empty_rss))
+            .mount(&server_fast)
+            .await;
+
+        // "azure" (alphabetically earlier) responds slow
+        Mock::given(method("GET"))
+            .and(path("/slow.rss"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(empty_rss)
+                    .set_delay(std::time::Duration::from_millis(100)),
+            )
+            .mount(&server_slow)
+            .await;
+
+        // Register providers in reverse alphabetical order
+        let providers: Vec<Box<dyn StatusProvider>> = vec![
+            Box::new(crate::providers::twilio::new_unvalidated(format!(
+                "{}/fast.rss",
+                server_fast.uri()
+            ))),
+            Box::new(crate::providers::azure::new_unvalidated(format!(
+                "{}/slow.rss",
+                server_slow.uri()
+            ))),
+        ];
+
+        let config = ConfigBuilder::new()
+            .providers(vec![])
+            .notifiers(vec![])
+            .state_file(state_path(&tmp))
+            .build()
+            .unwrap();
+
+        let scheduler = Scheduler::new_for_test(config, providers);
+        let results = scheduler.fetch_all_providers_concurrently().await;
+
+        // Results should be sorted alphabetically, regardless of completion order
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "azure");
+        assert_eq!(results[1].name, "twilio");
     }
 }

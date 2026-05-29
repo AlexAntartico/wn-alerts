@@ -104,7 +104,7 @@ All settings via environment variables or `.env` file.
 | `PROVIDERS` | `azure` | Comma-separated list of enabled providers |
 | `PROVIDER_AZURE_FEED_URL` | `https://azure.status.microsoft/en-us/status/feed/` | Azure RSS feed endpoint |
 | `PROVIDER_AWS_FEED_URL` | `https://status.aws.amazon.com/rss/all.rss` | AWS RSS feed endpoint |
-| `PROVIDER_TWILIO_API_URL` | `https://status.twilio.com/api/v2/incidents.json` | Twilio JSON API endpoint |
+| `PROVIDER_TWILIO_FEED_URL` | `https://status.twilio.com/history.rss` | Twilio RSS feed endpoint |
 | `PROVIDER_AIRSHIP_FEED_URL` | `https://status.airship.com/rss` | Airship RSS feed endpoint |
 | `PROVIDER_GITHUB_FEED_URL` | `https://www.githubstatus.com/history.rss` | GitHub RSS feed endpoint |
 | `PROVIDER_CLOUDFLARE_FEED_URL` | `https://www.cloudflarestatus.com/history.rss` | Cloudflare RSS feed endpoint |
@@ -222,43 +222,50 @@ pub mod github;
 }
 ```
 
-### Step 4: Add integration tests in `tests/integration_test.rs`
+### Step 4: Add integration tests in `tests/<name>_provider.rs`
+
+Create a new file — one per provider. Import the shared helpers from `tests/common/mod.rs` (`RSS_ITEM_XML`, `build_client`).
 
 3 wiremock-based tests per provider:
 
 ```rust
+mod common;
+
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+use wn_alerts::StatusProvider;
+
 #[tokio::test]
-async fn github_provider_fetches_and_parses_rss() {
+async fn fetches_and_parses_rss() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("GET"))
         .and(path("/history.rss"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(RSS_ITEM_XML))
+        .respond_with(ResponseTemplate::new(200).set_body_string(common::RSS_ITEM_XML))
         .mount(&mock_server)
         .await;
 
     let feed_url = format!("{}/history.rss", mock_server.uri());
     let provider = wn_alerts::providers::github::new_unvalidated(feed_url);
-    let client = build_client();
 
-    let incidents = provider.check(&client).await.expect("check should succeed");
+    let incidents = provider.check(&common::build_client()).await.expect("check should succeed");
     assert_eq!(incidents.len(), 1);
     assert_eq!(incidents[0].id, "integ-test-guid-001");
     assert_eq!(incidents[0].provider, "github");
 }
 
 #[tokio::test]
-async fn github_provider_handles_empty_feed() {
+async fn handles_empty_feed() {
     // Mock returns RSS with <channel> but no <item> → assert incidents.is_empty()
 }
 
 #[tokio::test]
-async fn github_provider_handles_http_error() {
+async fn handles_http_error() {
     // Mock returns 500 → assert result.is_err()
 }
 ```
 
-Reuse the shared `RSS_ITEM_XML` constant already defined at the top of the file.
+To run just the new file: `cargo test --test github_provider`
 
 ### Step 5: Update configuration in README
 
@@ -268,7 +275,7 @@ Add the provider to these README sections:
 - **Architecture** (`src/` tree): add entry under `providers/`
 - **Provider variable table**: add `PROVIDER_{NAME}_{KEY}` row with default URL
 - **Example `.env`**: add to `PROVIDERS=` list
-- **Test count**: bump unit by 2, integration by 3 (e.g. `86 unit` → `88 unit`, `20 integration` → `23 integration`)
+- **Test count**: bump unit by 2, integration by 3 in the Testing section below
 
 ### Provider checklist (before PR)
 
@@ -276,7 +283,7 @@ Add the provider to these README sections:
 - [ ] 2 URL validation unit tests in `url_validation_tests` (`validates_allowed_domains`, `rejects_disallowed_domains`)
 - [ ] `pub mod <name>;` added to `src/providers/mod.rs`
 - [ ] Factory match arm added in `build_one()` with default URL
-- [ ] 3 integration tests in `tests/integration_test.rs` (fetch+parse, empty, HTTP error)
+- [ ] 3 integration tests in `tests/<name>_provider.rs` (fetch+parse, empty, HTTP error)
 - [ ] `cargo test` — all tests pass (expect +2 unit, +3 integration vs current total)
 - [ ] `cargo clippy` — zero warnings
 - [ ] README updated (5 places listed above)
@@ -290,10 +297,14 @@ Add the provider to these README sections:
 ## Testing
 
 ```bash
-cargo test
+cargo test                          # run everything
+cargo test --test azure_provider    # run one provider's integration tests
+cargo test --test telegram_notifier # run notifier integration tests
 ```
 
-118 tests: 91 unit (providers, notifiers, state, config, HTML utils, scheduler concurrency) + 27 integration (wiremock-based HTTP tests).
+119 tests: 93 unit (providers, notifiers, state, config, HTML utils, scheduler concurrency) + 26 integration (wiremock-based HTTP tests).
+
+Integration tests live one file per provider/notifier under `tests/`. Shared fixtures (`RSS_ITEM_XML`, `build_client`) are in `tests/common/mod.rs`.
 
 ### Concurrency tests
 
