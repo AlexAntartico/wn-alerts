@@ -514,3 +514,105 @@ async fn imperva_provider_handles_http_error() {
     let result = provider.check(&client).await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn rss_provider_rejects_oversized_body() {
+    let mock_server = MockServer::start().await;
+
+    // Actual body one byte over the limit; wiremock sets Content-Length to match,
+    // so the Content-Length fast-path fires before any body bytes are read.
+    let large_body = vec![0u8; wn_alerts::providers::rss_common::MAX_FEED_SIZE + 1];
+    Mock::given(method("GET"))
+        .and(path("/feed.rss"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(large_body))
+        .mount(&mock_server)
+        .await;
+
+    let feed_url = format!("{}/feed.rss", mock_server.uri());
+    let provider = wn_alerts::providers::azure::new_unvalidated(feed_url);
+    let client = build_client();
+
+    let result = provider.check(&client).await;
+    assert!(result.is_err(), "oversized body should be rejected");
+    match result.unwrap_err() {
+        wn_alerts::AppError::InvalidConfig { value, .. } => {
+            assert!(value.contains("too large"), "error should mention size: {value}");
+        }
+        other => panic!("expected InvalidConfig, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn telegram_notifier_truncates_large_error_body() {
+    let mock_server = MockServer::start().await;
+
+    // Error body is 8 KB — double the 4 KB cap — to verify truncation.
+    let large_error = "x".repeat(8 * 1024);
+    Mock::given(method("POST"))
+        .and(path("/botbad-token/sendMessage"))
+        .respond_with(ResponseTemplate::new(429).set_body_string(large_error))
+        .mount(&mock_server)
+        .await;
+
+    let client = reqwest::Client::new();
+    let incident = wn_alerts::Incident {
+        provider: "azure".into(),
+        id: "tg-large-err".into(),
+        title: "Test".into(),
+        description: "Desc".into(),
+        link: "".into(),
+        occurred_at: "".into(),
+    };
+    let notifier = wn_alerts::notifiers::telegram::TelegramNotifier::new(
+        "bad-token".into(),
+        "456".into(),
+    )
+    .with_api_url(mock_server.uri());
+
+    let result = notifier.notify(&client, &incident).await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        wn_alerts::AppError::TelegramApi { status, body } => {
+            assert_eq!(status, 429);
+            assert!(
+                body.len() <= 4 * 1024,
+                "error body should be capped at 4 KB, got {} bytes",
+                body.len()
+            );
+        }
+        other => panic!("expected TelegramApi error, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn rss_provider_rejects_redirect_response() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/feed.rss"))
+        .respond_with(
+            ResponseTemplate::new(301)
+                .insert_header("Location", "http://169.254.169.254/latest/meta-data/"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let feed_url = format!("{}/feed.rss", mock_server.uri());
+    let provider = wn_alerts::providers::azure::new_unvalidated(feed_url);
+    // Use the app's real client so Policy::none() is in effect
+    let client = wn_alerts::config::ConfigBuilder::new()
+        .build()
+        .unwrap()
+        .build_client()
+        .unwrap();
+
+    let result = provider.check(&client).await;
+    assert!(result.is_err(), "301 redirect should be rejected");
+    match result.unwrap_err() {
+        wn_alerts::AppError::InvalidConfig { value, .. } => {
+            assert!(value.contains("301"), "error should mention the status code");
+            assert!(value.contains("redirect"), "error should mention redirects");
+        }
+        other => panic!("expected InvalidConfig, got {:?}", other),
+    }
+}

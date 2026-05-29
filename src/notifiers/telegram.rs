@@ -85,7 +85,15 @@ impl super::Notifier for TelegramNotifier {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
+            const MAX_ERROR_BODY: usize = 4 * 1024; // 4 KB
+            let body = response
+                .bytes()
+                .await
+                .map(|b| {
+                    let truncated = &b[..b.len().min(MAX_ERROR_BODY)];
+                    String::from_utf8_lossy(truncated).into_owned()
+                })
+                .unwrap_or_default();
             return Err(AppError::TelegramApi { status, body });
         }
 
