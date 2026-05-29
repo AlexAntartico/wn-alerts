@@ -1,6 +1,6 @@
 # wn-alerts
 
-Multi-provider service status monitor with pluggable notifiers. Polls status endpoints for Azure, AWS, Twilio, Airship, GitHub, Cloudflare (and more) and sends alerts via Telegram when incidents are detected.
+Multi-provider service status monitor with pluggable notifiers. Polls status endpoints for Azure, AWS, Twilio, Airship, GitHub, Cloudflare, Imperva (and more) and sends alerts via Telegram when incidents are detected.
 
 ## Quick start
 
@@ -35,22 +35,23 @@ src/
 │
 ├── providers/                  # One module per service
 │   ├── mod.rs                  # Factory — maps config names → concrete providers
-│   ├── rss_common.rs           # Shared RssProvider struct (validation + parsing + trait impl)
+│   ├── rss_common.rs           # Shared RssProvider struct (SSRF validation, size cap, RSS parsing)
 │   ├── azure.rs                # Azure RSS feed provider
 │   ├── aws.rs                  # AWS RSS feed provider
-│   ├── twilio.rs               # Twilio JSON API provider
+│   ├── twilio.rs               # Twilio RSS feed provider
 │   ├── airship.rs              # Airship RSS feed provider
 │   ├── github.rs               # GitHub RSS feed provider (statuspage.io)
-│   └── cloudflare.rs           # Cloudflare RSS feed provider (statuspage.io)
+│   ├── cloudflare.rs           # Cloudflare RSS feed provider (statuspage.io)
+│   └── imperva.rs              # Imperva RSS feed provider (statuspage.io)
 │
 ├── notifiers/                  # Notification channels
 │   ├── mod.rs                  # Notifier trait + factory
-│   └── telegram.rs             # Telegram notifier (HTML-formatted messages)
+│   └── telegram.rs             # Telegram notifier (HTML-formatted, rate-limited)
 │
 ├── utils/
-│   └── html.rs                 # Shared HTML entity helpers
+│   └── html.rs                 # HTML tag stripping, entity decode/escape, date formatting
 │
-├── config.rs                   # ConfigBuilder + env parsing + validation
+├── config.rs                   # ConfigBuilder + env parsing + validation + HTTP client
 ├── error.rs                    # AppError enum (thiserror)
 ├── lib.rs                      # Crate root, re-exports
 └── main.rs                     # Thin binary entry point
@@ -276,7 +277,7 @@ Add the provider to these README sections:
 - [ ] `pub mod <name>;` added to `src/providers/mod.rs`
 - [ ] Factory match arm added in `build_one()` with default URL
 - [ ] 3 integration tests in `tests/integration_test.rs` (fetch+parse, empty, HTTP error)
-- [ ] `cargo test` — all tests pass (expect 5 more than current total)
+- [ ] `cargo test` — all tests pass (expect +2 unit, +3 integration vs current total)
 - [ ] `cargo clippy` — zero warnings
 - [ ] README updated (5 places listed above)
 
@@ -292,11 +293,19 @@ Add the provider to these README sections:
 cargo test
 ```
 
-106 tests: 86 unit (providers, notifiers, state, config, HTML utils) + 20 integration (wiremock-based HTTP tests).
+113 tests: 87 unit (providers, notifiers, state, config, HTML utils) + 26 integration (wiremock-based HTTP tests).
+
+## Security
+
+**Key controls:**
+- SSRF protection: domain allowlist, private IP blocking, scheme validation, redirect following disabled
+- Response size cap: feed responses rejected above 10 MB (Content-Length check + byte-count check)
+- Secret handling: bot tokens redacted from logs and error messages, state files 0o600 permissions
+- Bounded resource usage: config validation, state ID caps (10k/provider), graceful shutdown
+- XML parsing safety: quick-xml with no external entity processing
 
 # To do:
 [] Okta is requesting auth
 [] f5 domain is gone, need to check in statuspage.io
-[] check the status_200 tests are working
 
 For now okta and f5 remain disabled
