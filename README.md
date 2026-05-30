@@ -14,12 +14,33 @@ cargo run --release
 
 The daemon runs a poll loop every N minutes (default 5). Each tick:
 
-1. **Fan-out phase**: All enabled providers are queried **concurrently** via `tokio::spawn` — a slow or unreachable provider doesn't block others. Wall-clock tick time is `max(provider_times)` instead of `sum(provider_times)`. For 7 providers at 30s timeout each, that's **30 seconds max** instead of 3.5 minutes.
-2. **Fan-in phase**: Results are processed sequentially — new incidents (not previously seen) are routed to every enabled notifier, and marked seen in state
-3. Each incident is marked seen immediately after notification, regardless of notification success — failed notifications are logged but do not block the cycle
-4. Seen incident IDs are persisted to `state.json` after every cycle so alerts only fire once per incident
+1. **Backoff check**: any provider currently in backoff is skipped and its remaining cycle count is decremented. A `WARN` log is emitted for each skipped provider. Providers not in backoff proceed to the next phase.
+2. **Fan-out phase**: Active providers are queried **concurrently** via `tokio::spawn` — a slow or unreachable provider doesn't block others. Wall-clock tick time is `max(provider_times)` instead of `sum(provider_times)`. For 7 providers at 30s timeout each, that's **30 seconds max** instead of 3.5 minutes.
+3. **Fan-in phase**: Results are processed sequentially — new incidents (not previously seen) are routed to every enabled notifier, and marked seen in state
+4. An incident is marked seen **only after at least one notifier succeeds**. If all notifiers fail, the incident is left unseen and will retry on the next cycle — failure is logged as a warning
+5. Seen incident IDs are persisted to `state.json` after every cycle so alerts only fire once per incident
 
-SIGINT (Ctrl+C) triggers a graceful shutdown with state save.
+**SIGINT** (Ctrl+C) and **SIGTERM** both trigger a graceful shutdown with state save. SIGTERM support means `systemctl stop` and `systemctl restart` are safe — state is always persisted before exit.
+
+### Provider backoff
+
+By default every provider is polled every cycle regardless of errors. Setting `PROVIDER_FAILURE_THRESHOLD` enables exponential backoff for persistently failing providers:
+
+- After **N consecutive failures** the provider is skipped for `2^N` cycles (capped at `PROVIDER_BACKOFF_MAX_CYCLES`)
+- Each skipped cycle decrements the counter and emits a `WARN` log: `Provider is backing off — skipping this cycle cycles_remaining=N`
+- The **first successful poll resets** both the failure counter and any remaining backoff
+- Backoff state is persisted to `state.json` so a daemon restart does not reset the budget
+
+Example with `PROVIDER_FAILURE_THRESHOLD=3` and a 5-minute poll interval:
+
+| Consecutive failures | Backoff cycles | Approx. skip time |
+|---|---|---|
+| 3 (threshold hit) | 8 | 40 min |
+| 4 | 16 | 1.3 hr |
+| 5 | 32 (default cap) | 2.7 hr |
+| 6+ | 32 (capped) | 2.7 hr |
+
+Without this setting the daemon keeps retrying dead providers every cycle, producing one `ERROR` log per poll indefinitely. Enabling backoff reduces that to a single `ERROR` burst followed by quiet `WARN` skips.
 
 ```bash
 May 29 12:33:51 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:51.533707Z  INFO wn_alerts::core::scheduler: --- Poll cycle start ---
@@ -130,6 +151,13 @@ All settings via environment variables or `.env` file.
 | `PROVIDER_GITHUB_FEED_URL` | `https://www.githubstatus.com/history.rss` | GitHub RSS feed endpoint |
 | `PROVIDER_CLOUDFLARE_FEED_URL` | `https://www.cloudflarestatus.com/history.rss` | Cloudflare RSS feed endpoint |
 
+#### Provider backoff (optional)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROVIDER_FAILURE_THRESHOLD` | unset | Consecutive failures before backoff starts. Unset = disabled, poll every cycle |
+| `PROVIDER_BACKOFF_MAX_CYCLES` | `32` | Maximum cycles to skip when in backoff (ignored if threshold unset). At 5 min intervals, 32 cycles ≈ 2.7 hours |
+
 Provider-specific config follows the pattern `PROVIDER_{NAME}_{KEY}`.
 
 ### Notifiers
@@ -156,6 +184,10 @@ POLL_INTERVAL_MINUTES=5
 REQUEST_TIMEOUT_SECS=30
 
 PROVIDER_AZURE_FEED_URL=https://azure.status.microsoft/en-us/status/feed/
+
+# Optional: back off after 3 consecutive failures, skip up to 32 cycles (~2.7 hr at 5 min interval)
+# PROVIDER_FAILURE_THRESHOLD=3
+# PROVIDER_BACKOFF_MAX_CYCLES=32
 
 NOTIFIER_TELEGRAM_BOT_TOKEN=123456:ABC-DEF1234gh...
 NOTIFIER_TELEGRAM_CHAT_ID=-1001234567890
@@ -328,7 +360,7 @@ cargo test --test azure_provider    # run one provider's integration tests
 cargo test --test telegram_notifier # run notifier integration tests
 ```
 
-119 tests: 93 unit (providers, notifiers, state, config, HTML utils, scheduler concurrency) + 26 integration (wiremock-based HTTP tests).
+143 tests: 117 unit (providers, notifiers, state, config, HTML utils, scheduler) + 26 integration (wiremock-based HTTP tests).
 
 Integration tests live one file per provider/notifier under `tests/`. Shared fixtures (`RSS_ITEM_XML`, `build_client`) are in `tests/common/mod.rs`.
 
@@ -344,6 +376,22 @@ async fn fetch_all_providers_concurrently_is_actually_concurrent() { ... }
 ```
 
 Run with: `cargo test --lib core::scheduler::tests`
+
+### Testing graceful shutdown
+
+The scheduler's graceful shutdown path (state saved on signal) is tested via `run_with_shutdown`, a private method that accepts any `Future<Output = &'static str>` as the shutdown trigger. In production, `run()` passes `shutdown_signal()` (which waits for SIGINT or SIGTERM). In tests, pass an immediately-resolving future to exercise the shutdown path without OS signals:
+
+```rust
+// Simulates receiving SIGTERM — no real signal sent to the process
+scheduler
+    .run_with_shutdown(std::future::ready("SIGTERM"))
+    .await
+    .unwrap();
+
+assert!(std::path::Path::new(&state_file).exists());
+```
+
+`run_with_shutdown` is accessible from unit tests inside `src/core/scheduler.rs` (same module, `use super::*`). It is not part of the public API.
 
 ## Security
 
