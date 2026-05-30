@@ -2,6 +2,7 @@ use crate::error::AppError;
 
 const MAX_POLL_INTERVAL_MINUTES: u64 = 1440; // 24 hours
 const MAX_REQUEST_TIMEOUT_SECS: u64 = 300;   // 5 minutes
+pub const DEFAULT_BACKOFF_MAX_CYCLES: u32 = 32;
 
 pub struct Config {
     pub poll_interval_minutes: u64,
@@ -9,6 +10,10 @@ pub struct Config {
     pub state_file_path: String,
     pub enabled_providers: Vec<String>,
     pub enabled_notifiers: Vec<String>,
+    /// None = backoff disabled (default). Some(n) = enter backoff after n consecutive failures.
+    pub failure_threshold: Option<u32>,
+    /// Maximum cycles to skip when backing off (default 32).
+    pub backoff_max_cycles: u32,
 }
 
 // Custom Debug implementation to redact sensitive information
@@ -21,6 +26,8 @@ impl std::fmt::Debug for Config {
             .field("state_file_path", &self.state_file_path)
             .field("enabled_providers", &self.enabled_providers)
             .field("enabled_notifiers", &self.enabled_notifiers)
+            .field("failure_threshold", &self.failure_threshold)
+            .field("backoff_max_cycles", &self.backoff_max_cycles)
             .finish()
     }
 }
@@ -31,6 +38,8 @@ pub struct ConfigBuilder {
     state_file_path: String,
     enabled_providers: Vec<String>,
     enabled_notifiers: Vec<String>,
+    failure_threshold: Option<u32>,
+    backoff_max_cycles: u32,
 }
 
 impl ConfigBuilder {
@@ -41,6 +50,8 @@ impl ConfigBuilder {
             state_file_path: "state.json".into(),
             enabled_providers: vec!["azure".into()],
             enabled_notifiers: vec!["telegram".into()],
+            failure_threshold: None,
+            backoff_max_cycles: DEFAULT_BACKOFF_MAX_CYCLES,
         }
     }
 
@@ -69,6 +80,16 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn failure_threshold(mut self, threshold: Option<u32>) -> Self {
+        self.failure_threshold = threshold;
+        self
+    }
+
+    pub fn backoff_max_cycles(mut self, cycles: u32) -> Self {
+        self.backoff_max_cycles = cycles;
+        self
+    }
+
     pub fn build(self) -> Result<Config, AppError> {
         if self.poll_interval_minutes == 0 {
             return Err(AppError::InvalidConfig {
@@ -94,6 +115,20 @@ impl ConfigBuilder {
                 value: format!("{} (max {})", self.request_timeout_secs, MAX_REQUEST_TIMEOUT_SECS),
             });
         }
+        if let Some(threshold) = self.failure_threshold {
+            if threshold == 0 {
+                return Err(AppError::InvalidConfig {
+                    key: "PROVIDER_FAILURE_THRESHOLD",
+                    value: "0 (must be at least 1)".into(),
+                });
+            }
+        }
+        if self.backoff_max_cycles == 0 {
+            return Err(AppError::InvalidConfig {
+                key: "PROVIDER_BACKOFF_MAX_CYCLES",
+                value: "0 (must be at least 1)".into(),
+            });
+        }
 
         Ok(Config {
             poll_interval_minutes: self.poll_interval_minutes,
@@ -101,6 +136,8 @@ impl ConfigBuilder {
             state_file_path: self.state_file_path,
             enabled_providers: self.enabled_providers,
             enabled_notifiers: self.enabled_notifiers,
+            failure_threshold: self.failure_threshold,
+            backoff_max_cycles: self.backoff_max_cycles,
         })
     }
 }
@@ -118,6 +155,11 @@ impl Config {
         let providers = parse_env_list("PROVIDERS", "azure");
         let notifiers = parse_env_list("NOTIFIERS", "telegram");
         let state_file_path = env_or_default("STATE_FILE_PATH", "state.json");
+        let failure_threshold = parse_env_optional_u32("PROVIDER_FAILURE_THRESHOLD")?;
+        let backoff_max_cycles = parse_env_u32(
+            "PROVIDER_BACKOFF_MAX_CYCLES",
+            &DEFAULT_BACKOFF_MAX_CYCLES.to_string(),
+        )?;
 
         ConfigBuilder::new()
             .poll_interval(poll_interval)
@@ -125,6 +167,8 @@ impl Config {
             .state_file(state_file_path)
             .providers(providers)
             .notifiers(notifiers)
+            .failure_threshold(failure_threshold)
+            .backoff_max_cycles(backoff_max_cycles)
             .build()
     }
 
@@ -171,6 +215,24 @@ fn parse_env_u64(key: &'static str, default: &str) -> Result<u64, AppError> {
     })
 }
 
+fn parse_env_u32(key: &'static str, default: &str) -> Result<u32, AppError> {
+    let raw = env_or_default(key, default);
+    raw.parse().map_err(|_| AppError::InvalidConfig {
+        key,
+        value: raw,
+    })
+}
+
+fn parse_env_optional_u32(key: &'static str) -> Result<Option<u32>, AppError> {
+    match std::env::var(key) {
+        Ok(raw) => raw.parse::<u32>().map(Some).map_err(|_| AppError::InvalidConfig {
+            key,
+            value: raw,
+        }),
+        Err(_) => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +245,8 @@ mod tests {
         assert_eq!(config.state_file_path, "state.json");
         assert_eq!(config.enabled_providers, vec!["azure"]);
         assert_eq!(config.enabled_notifiers, vec!["telegram"]);
+        assert_eq!(config.failure_threshold, None);
+        assert_eq!(config.backoff_max_cycles, DEFAULT_BACKOFF_MAX_CYCLES);
     }
 
     #[test]
@@ -330,5 +394,38 @@ mod tests {
     fn notifier_param_returns_none_when_unset() {
         std::env::remove_var("NOTIFIER_ABSENT_NOTIFIER_CHAT_ID");
         assert_eq!(notifier_param("absent_notifier", "CHAT_ID"), None);
+    }
+
+    #[test]
+    fn builder_accepts_failure_threshold() {
+        let config = ConfigBuilder::new()
+            .failure_threshold(Some(3))
+            .build()
+            .unwrap();
+        assert_eq!(config.failure_threshold, Some(3));
+    }
+
+    #[test]
+    fn builder_rejects_zero_failure_threshold() {
+        let result = ConfigBuilder::new().failure_threshold(Some(0)).build();
+        match result.unwrap_err() {
+            AppError::InvalidConfig { key: "PROVIDER_FAILURE_THRESHOLD", .. } => {}
+            other => panic!("expected InvalidConfig, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn builder_rejects_zero_backoff_max_cycles() {
+        let result = ConfigBuilder::new().backoff_max_cycles(0).build();
+        match result.unwrap_err() {
+            AppError::InvalidConfig { key: "PROVIDER_BACKOFF_MAX_CYCLES", .. } => {}
+            other => panic!("expected InvalidConfig, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn builder_accepts_custom_backoff_max_cycles() {
+        let config = ConfigBuilder::new().backoff_max_cycles(16).build().unwrap();
+        assert_eq!(config.backoff_max_cycles, 16);
     }
 }

@@ -72,6 +72,12 @@ pub struct AppState {
 pub struct ProviderState {
     pub seen_ids: BoundedSeenSet,
     pub last_poll: Option<String>,
+    /// Consecutive poll failures since last success. Resets to 0 on any successful poll.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// Cycles remaining to skip before polling this provider again.
+    #[serde(default)]
+    pub backoff_cycles_remaining: u32,
 }
 
 impl AppState {
@@ -87,7 +93,7 @@ impl AppState {
             .entry(provider.to_string())
             .or_default()
             .seen_ids
-            .insert(id);  // BoundedSeenSet::insert, not HashSet::insert
+            .insert(id);
     }
 
     pub fn set_poll_time(&mut self, provider: &str, time: String) {
@@ -95,6 +101,47 @@ impl AppState {
             .entry(provider.to_string())
             .or_default()
             .last_poll = Some(time);
+    }
+
+    pub fn record_failure(&mut self, provider: &str) {
+        self.providers
+            .entry(provider.to_string())
+            .or_default()
+            .consecutive_failures += 1;
+    }
+
+    /// Reset failure streak and clear any remaining backoff on a successful poll.
+    pub fn record_success(&mut self, provider: &str) {
+        let entry = self.providers.entry(provider.to_string()).or_default();
+        entry.consecutive_failures = 0;
+        entry.backoff_cycles_remaining = 0;
+    }
+
+    pub fn set_backoff(&mut self, provider: &str, cycles: u32) {
+        self.providers
+            .entry(provider.to_string())
+            .or_default()
+            .backoff_cycles_remaining = cycles;
+    }
+
+    pub fn decrement_backoff(&mut self, provider: &str) {
+        if let Some(s) = self.providers.get_mut(provider) {
+            s.backoff_cycles_remaining = s.backoff_cycles_remaining.saturating_sub(1);
+        }
+    }
+
+    pub fn consecutive_failures(&self, provider: &str) -> u32 {
+        self.providers
+            .get(provider)
+            .map(|s| s.consecutive_failures)
+            .unwrap_or(0)
+    }
+
+    pub fn backoff_cycles_remaining(&self, provider: &str) -> u32 {
+        self.providers
+            .get(provider)
+            .map(|s| s.backoff_cycles_remaining)
+            .unwrap_or(0)
     }
 }
 
@@ -328,6 +375,66 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "state file should be mode 0o600, got {:#o}", mode & 0o777);
+    }
+
+    // ── Backoff tracking ──────────────────────────────────────────────────────
+
+    #[test]
+    fn record_failure_increments_counter() {
+        let mut state = AppState::default();
+        state.record_failure("azure");
+        state.record_failure("azure");
+        assert_eq!(state.consecutive_failures("azure"), 2);
+        assert_eq!(state.consecutive_failures("aws"), 0);
+    }
+
+    #[test]
+    fn record_success_resets_failure_counter_and_backoff() {
+        let mut state = AppState::default();
+        state.record_failure("azure");
+        state.record_failure("azure");
+        state.set_backoff("azure", 8);
+        state.record_success("azure");
+        assert_eq!(state.consecutive_failures("azure"), 0);
+        assert_eq!(state.backoff_cycles_remaining("azure"), 0);
+    }
+
+    #[test]
+    fn set_and_decrement_backoff() {
+        let mut state = AppState::default();
+        state.set_backoff("azure", 3);
+        assert_eq!(state.backoff_cycles_remaining("azure"), 3);
+        state.decrement_backoff("azure");
+        assert_eq!(state.backoff_cycles_remaining("azure"), 2);
+        state.decrement_backoff("azure");
+        state.decrement_backoff("azure");
+        assert_eq!(state.backoff_cycles_remaining("azure"), 0);
+        // saturating — must not underflow
+        state.decrement_backoff("azure");
+        assert_eq!(state.backoff_cycles_remaining("azure"), 0);
+    }
+
+    #[test]
+    fn backoff_fields_persist_via_serde() {
+        let mut state = AppState::default();
+        state.record_failure("azure");
+        state.record_failure("azure");
+        state.set_backoff("azure", 4);
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: AppState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.consecutive_failures("azure"), 2);
+        assert_eq!(restored.backoff_cycles_remaining("azure"), 4);
+    }
+
+    #[test]
+    fn backoff_fields_default_to_zero_on_legacy_state() {
+        // Simulate a state.json written before backoff fields existed
+        let legacy = r#"{"providers":{"azure":{"seen_ids":[],"last_poll":null}}}"#;
+        let state: AppState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(state.consecutive_failures("azure"), 0);
+        assert_eq!(state.backoff_cycles_remaining("azure"), 0);
     }
 
     #[test]
