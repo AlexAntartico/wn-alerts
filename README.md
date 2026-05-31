@@ -1,6 +1,6 @@
 # wn-alerts
 
-Multi-provider service status monitor with pluggable notifiers. Polls status endpoints for Azure, AWS, Twilio, Airship, GitHub, Cloudflare, Imperva (and more) and sends alerts via Telegram when incidents are detected.
+Multi-provider service status monitor with pluggable notifiers. Polls status endpoints for Azure, AWS, Twilio, Airship, GitHub, Cloudflare, Imperva, Microsoft Admin Center, Power Platform Admin Center (and more) and sends alerts via Telegram when incidents are detected.
 
 ## Quick start
 
@@ -84,7 +84,9 @@ src/
 │   ├── airship.rs              # Airship RSS feed provider
 │   ├── github.rs               # GitHub RSS feed provider (statuspage.io)
 │   ├── cloudflare.rs           # Cloudflare RSS feed provider (statuspage.io)
-│   └── imperva.rs              # Imperva RSS feed provider (statuspage.io)
+│   ├── imperva.rs              # Imperva RSS feed provider (statuspage.io)
+│   ├── microsoft_ppac.rs       # Power Platform Admin Center RSS feed provider
+│   └── microsoft_mac.rs        # Microsoft Admin Center RSS feed provider
 │
 ├── notifiers/                  # Notification channels
 │   ├── mod.rs                  # Notifier trait + factory
@@ -151,6 +153,8 @@ All settings via environment variables or `.env` file.
 | `PROVIDER_GITHUB_FEED_URL` | `https://www.githubstatus.com/history.rss` | GitHub RSS feed endpoint |
 | `PROVIDER_CLOUDFLARE_FEED_URL` | `https://www.cloudflarestatus.com/history.rss` | Cloudflare RSS feed endpoint |
 | `PROVIDER_IMPERVA_FEED_URL` | `https://status.imperva.com/history.rss` | Imperva RSS feed endpoint |
+| `PROVIDER_MICROSOFT_PPAC_FEED_URL` | `https://status.cloud.microsoft/api/feed/ppac` | Power Platform Admin Center RSS feed endpoint |
+| `PROVIDER_MICROSOFT_MAC_FEED_URL` | `https://status.cloud.microsoft/api/feed/mac` | Microsoft Admin Center RSS feed endpoint |
 
 #### Provider backoff (optional)
 
@@ -179,12 +183,14 @@ Notifier-specific config follows the pattern `NOTIFIER_{NAME}_{KEY}`.
 ### Example `.env`
 
 ```bash
-PROVIDERS=azure,aws,github,cloudflare
+PROVIDERS=azure,aws,github,cloudflare,microsoft_ppac,microsoft_mac
 NOTIFIERS=telegram
 POLL_INTERVAL_MINUTES=5
 REQUEST_TIMEOUT_SECS=30
 
-PROVIDER_AZURE_FEED_URL=https://rssfeed.azure.status.microsoft/en-us/status/feed/
+PROVIDER_AZURE_FEED_URL=https://azure.status.microsoft/en-us/status/feed/
+PROVIDER_MICROSOFT_PPAC_FEED_URL=https://status.cloud.microsoft/api/feed/ppac
+PROVIDER_MICROSOFT_MAC_FEED_URL=https://status.cloud.microsoft/api/feed/mac
 
 # Optional: back off after 3 consecutive failures, skip up to 32 cycles (~2.7 hr at 5 min interval)
 # PROVIDER_FAILURE_THRESHOLD=3
@@ -360,7 +366,7 @@ cargo test --test azure_provider    # run one provider's integration tests
 cargo test --test telegram_notifier # run notifier integration tests
 ```
 
-143 tests: 117 unit (providers, notifiers, state, config, HTML utils, scheduler) + 26 integration (wiremock-based HTTP tests).
+153 tests: 121 unit (providers, notifiers, state, config, HTML utils, scheduler) + 32 integration (wiremock-based HTTP tests).
 
 Integration tests live one file per provider/notifier under `tests/`. Shared fixtures (`RSS_ITEM_XML`, `build_client`) are in `tests/common/mod.rs`.
 

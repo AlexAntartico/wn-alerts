@@ -5,6 +5,8 @@ pub mod cloudflare;
 // pub mod f5; // disabled: domain gone, see src/providers/f5.rs
 pub mod github;
 pub mod imperva;
+pub mod microsoft_mac;
+pub mod microsoft_ppac;
 // pub mod okta; // disabled: feed requires auth, see src/providers/okta.rs
 pub mod rss_common;
 pub mod twilio;
@@ -70,6 +72,16 @@ fn build_one(name: &str, _config: &Config) -> Result<Box<dyn StatusProvider>, Ap
         //         .unwrap_or_else(|| "https://status.f5.com/history.rss".into());
         //     Ok(Box::new(f5::new(feed_url)))
         // }
+        "microsoft_ppac" => {
+            let feed_url = crate::config::provider_param("microsoft_ppac", "FEED_URL")
+                .unwrap_or_else(|| "https://status.cloud.microsoft/api/feed/ppac".into());
+            Ok(Box::new(microsoft_ppac::new(feed_url)))
+        }
+        "microsoft_mac" => {
+            let feed_url = crate::config::provider_param("microsoft_mac", "FEED_URL")
+                .unwrap_or_else(|| "https://status.cloud.microsoft/api/feed/mac".into());
+            Ok(Box::new(microsoft_mac::new(feed_url)))
+        }
         unknown => Err(AppError::UnknownProvider(unknown.to_string())),
     }
 }
