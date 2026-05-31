@@ -5,6 +5,7 @@ pub mod cloudflare;
 // pub mod f5;
 pub mod github;
 pub mod imperva;
+pub mod microsoft;
 // pub mod okta;
 pub mod rss_common;
 pub mod twilio;
@@ -64,6 +65,11 @@ fn build_one(name: &str, _config: &Config) -> Result<Box<dyn StatusProvider>, Ap
             let feed_url = crate::config::provider_param("imperva", "FEED_URL")
                 .unwrap_or_else(|| "https://status.imperva.com/history.rss".into());
             Ok(Box::new(imperva::new(feed_url)))
+        }
+        "microsoft" => {
+            let feed_url = crate::config::provider_param("microsoft", "FEED_URL")
+                .unwrap_or_else(|| "https://status.microsoft.com/en-us/status/feed/".into());
+            Ok(Box::new(microsoft::new(feed_url)))
         }
         // "f5" => {
         //     let feed_url = crate::config::provider_param("f5", "FEED_URL")

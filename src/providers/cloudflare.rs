@@ -1,9 +1,6 @@
 use super::rss_common::RssProvider;
 
-const ALLOWED_DOMAINS: &[&str] = &[
-    "www.cloudflarestatus.com",
-    "cloudflarestatus.com",
-];
+const ALLOWED_DOMAINS: &[&str] = &["cloudflarestatus.com"];
 const CONFIG_KEY: &str = "PROVIDER_CLOUDFLARE_FEED_URL";
 
 pub fn new(feed_url: String) -> RssProvider {

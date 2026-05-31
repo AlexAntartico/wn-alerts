@@ -1,9 +1,6 @@
 use super::rss_common::RssProvider;
 
-const ALLOWED_DOMAINS: &[&str] = &[
-    "www.githubstatus.com",
-    "githubstatus.com",
-];
+const ALLOWED_DOMAINS: &[&str] = &["githubstatus.com"];
 const CONFIG_KEY: &str = "PROVIDER_GITHUB_FEED_URL";
 
 pub fn new(feed_url: String) -> RssProvider {
