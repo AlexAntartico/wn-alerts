@@ -32,7 +32,13 @@ async fn sends_message() {
     )
     .with_api_url(mock_server.uri());
 
-    let result = notifier.notify(&reqwest::Client::new(), &make_incident("azure", "tg-1")).await;
+    let result = notifier
+        .notify(
+            &reqwest::Client::new(),
+            &make_incident("azure", "tg-1"),
+            wn_alerts::notifiers::NotificationKind::New,
+        )
+        .await;
     assert!(result.is_ok(), "notify failed: {:?}", result.err());
 }
 
@@ -55,7 +61,13 @@ async fn handles_api_error() {
     )
     .with_api_url(mock_server.uri());
 
-    let result = notifier.notify(&reqwest::Client::new(), &make_incident("azure", "tg-fail")).await;
+    let result = notifier
+        .notify(
+            &reqwest::Client::new(),
+            &make_incident("azure", "tg-fail"),
+            wn_alerts::notifiers::NotificationKind::New,
+        )
+        .await;
     assert!(result.is_err());
     match result.unwrap_err() {
         wn_alerts::AppError::TelegramApi { status, .. } => assert_eq!(status, 401),
@@ -82,7 +94,11 @@ async fn truncates_large_error_body() {
     .with_api_url(mock_server.uri());
 
     let result = notifier
-        .notify(&reqwest::Client::new(), &make_incident("azure", "tg-large-err"))
+        .notify(
+            &reqwest::Client::new(),
+            &make_incident("azure", "tg-large-err"),
+            wn_alerts::notifiers::NotificationKind::New,
+        )
         .await;
     assert!(result.is_err());
     match result.unwrap_err() {

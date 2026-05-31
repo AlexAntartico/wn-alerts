@@ -16,11 +16,25 @@ The daemon runs a poll loop every N minutes (default 5). Each tick:
 
 1. **Backoff check**: any provider currently in backoff is skipped and its remaining cycle count is decremented. A `WARN` log is emitted for each skipped provider. Providers not in backoff proceed to the next phase.
 2. **Fan-out phase**: Active providers are queried **concurrently** via `tokio::spawn` — a slow or unreachable provider doesn't block others. Wall-clock tick time is `max(provider_times)` instead of `sum(provider_times)`. For 7 providers at 30s timeout each, that's **30 seconds max** instead of 3.5 minutes.
-3. **Fan-in phase**: Results are processed sequentially — new incidents (not previously seen) are routed to every enabled notifier, and marked seen in state
-4. An incident is marked seen **only after at least one notifier succeeds**. If all notifiers fail, the incident is left unseen and will retry on the next cycle — failure is logged as a warning
-5. Seen incident IDs are persisted to `state.json` after every cycle so alerts only fire once per incident
+3. **Fan-in phase**: Results are processed sequentially. An incident is alerted when it is either **new** (an id never seen before) or **changed** (a previously-seen incident whose content has been updated — see [Incident updates](#incident-updates)). Matching incidents are routed to every enabled notifier and recorded in state
+4. An incident state is recorded **only after at least one notifier succeeds**. If all notifiers fail, nothing is recorded and the incident will retry on the next cycle — failure is logged as a warning
+5. State is persisted to `state.json` after every cycle. Each incident is stored as an `id → content-fingerprint` pair, so a given incident state alerts exactly once and genuine updates still get through
 
 **SIGINT** (Ctrl+C) and **SIGTERM** both trigger a graceful shutdown with state save. SIGTERM support means `systemctl stop` and `systemctl restart` are safe — state is always persisted before exit.
+
+### Incident updates
+
+Status pages (statuspage.io and the like) keep a **single, stable id** for an incident across its entire lifetime and edit the same entry in place as it progresses — `Investigating` → `Identified` → `Monitoring` → `Resolved`. Deduplicating on the id alone would deliver only the first alert and silently drop every later update, including the resolution.
+
+To handle this, each incident is reduced to a **content fingerprint** — a stable hash of its title, description, and timestamp. State stores `id → fingerprint`, and the incident is re-alerted whenever that fingerprint changes:
+
+| Situation | Result |
+|---|---|
+| First time an id is seen | Alert labelled **`[PROVIDER] Incident`** |
+| Same id, content changed (a new status update) | Alert labelled **`[PROVIDER] Incident Update`** |
+| Same id, identical content | No alert |
+
+Fingerprints are deterministic across restarts (so the same content never re-alerts after a redeploy) and are tracked per provider within the same 10,000-entry budget as the seen ids.
 
 ### Provider backoff
 
@@ -63,7 +77,9 @@ May 29 12:33:53 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:53.506295Z  INFO wn
 May 29 12:33:53 sg1-vps-dev wn-alerts[691]: 2026-05-29T12:33:53.506822Z  INFO wn_alerts::core::scheduler: --- Poll cycle complete ---
 ```
 
-> **Note on `state.json` growth:** seen IDs are capped at 10,000 entries per provider (FIFO eviction). In practice this is several years of incidents and the file stays small. If you redeploy with a fresh `state.json` (or delete it) you will receive alerts for any incidents currently active in the feeds. To reset quietly, clear the file after a period of no active incidents.
+> **Note on `state.json` growth:** seen incidents are capped at 10,000 entries per provider (FIFO eviction). In practice this is several years of incidents and the file stays small. If you redeploy with a fresh `state.json` (or delete it) you will receive alerts for any incidents currently listed in the feeds. To reset quietly, clear the file after a period of no active incidents.
+>
+> **Upgrading from a pre-fingerprint build:** older state files stored seen incidents as a plain list of ids. They are still read correctly, but the first poll after upgrading treats every currently-listed incident as changed and re-alerts it once (as an update); after that, only genuine content changes fire.
 
 ## Architecture
 
@@ -72,7 +88,7 @@ src/
 ├── core/                       # Framework primitives
 │   ├── provider.rs             # StatusProvider trait (name + async check)
 │   ├── incident.rs             # Normalized Incident model
-│   ├── state.rs                # Per-provider seen-ID tracking (JSON persistence)
+│   ├── state.rs                # Per-provider id → content-fingerprint tracking (JSON persistence)
 │   └── scheduler.rs            # Poll loop — concurrent fan-out/fan-in orchestration
 │
 ├── providers/                  # One module per service
@@ -113,7 +129,12 @@ pub trait StatusProvider: Send + Sync {
 #[async_trait]
 pub trait Notifier: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn notify(&self, client: &reqwest::Client, incident: &Incident) -> Result<(), AppError>;
+    async fn notify(
+        &self,
+        client: &reqwest::Client,
+        incident: &Incident,
+        kind: NotificationKind, // New or Update — lets notifiers label follow-up alerts
+    ) -> Result<(), AppError>;
 }
 ```
 
@@ -122,7 +143,7 @@ pub trait Notifier: Send + Sync {
 | Field | Description |
 |-------|-------------|
 | `provider` | Provider name (`"azure"`, `"aws"`, etc.) |
-| `id` | Unique identifier for deduplication |
+| `id` | Stable incident identifier; paired with a content fingerprint for deduplication (see [Incident updates](#incident-updates)) |
 | `title` | Incident title |
 | `description` | Full description text |
 | `link` | URL to the incident details page |
@@ -138,7 +159,7 @@ All settings via environment variables or `.env` file.
 |----------|---------|-------------|
 | `POLL_INTERVAL_MINUTES` | `5` | Minutes between poll cycles (1–1440) |
 | `REQUEST_TIMEOUT_SECS` | `30` | HTTP request timeout in seconds (1–300) |
-| `STATE_FILE_PATH` | `state.json` | Path to state file for seen-ID tracking |
+| `STATE_FILE_PATH` | `state.json` | Path to state file for seen-incident + backoff tracking |
 | `RUST_LOG` | `info` | Log level (tracing subscriber) |
 
 ### Providers
@@ -366,7 +387,7 @@ cargo test --test azure_provider    # run one provider's integration tests
 cargo test --test telegram_notifier # run notifier integration tests
 ```
 
-153 tests: 121 unit (providers, notifiers, state, config, HTML utils, scheduler) + 32 integration (wiremock-based HTTP tests).
+163 tests: 131 unit (providers, notifiers, state, config, HTML utils, scheduler) + 32 integration (wiremock-based HTTP tests).
 
 Integration tests live one file per provider/notifier under `tests/`. Shared fixtures (`RSS_ITEM_XML`, `build_client`) are in `tests/common/mod.rs`.
 

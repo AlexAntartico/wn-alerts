@@ -6,10 +6,25 @@ use crate::config::Config;
 use crate::core::incident::Incident;
 use crate::error::AppError;
 
+/// Whether a notification is the first alert for an incident or a follow-up
+/// triggered by an in-place status update (e.g. Investigating → Identified).
+/// Lets notifiers label updates distinctly instead of re-sending an identical
+/// "new incident" message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationKind {
+    New,
+    Update,
+}
+
 #[async_trait]
 pub trait Notifier: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn notify(&self, client: &reqwest::Client, incident: &Incident) -> Result<(), AppError>;
+    async fn notify(
+        &self,
+        client: &reqwest::Client,
+        incident: &Incident,
+        kind: NotificationKind,
+    ) -> Result<(), AppError>;
 }
 
 pub fn build_all(config: &Config) -> Result<Vec<Box<dyn Notifier>>, AppError> {

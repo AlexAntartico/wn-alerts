@@ -3,7 +3,7 @@
 ///
 ///   cargo run --example test_notify
 use wn_alerts::notifiers::telegram::TelegramNotifier;
-use wn_alerts::notifiers::Notifier;
+use wn_alerts::notifiers::{NotificationKind, Notifier};
 use wn_alerts::Incident;
 
 #[tokio::main]
@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let notifier = TelegramNotifier::new(token, chat_id);
 
     println!("Sending test notification...");
-    notifier.notify(&client, &incident).await?;
+    notifier.notify(&client, &incident, NotificationKind::New).await?;
     println!("Done — check your Telegram chat.");
 
     Ok(())

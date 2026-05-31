@@ -3,7 +3,7 @@ use crate::core::incident::Incident;
 use crate::core::provider::StatusProvider;
 use crate::core::state::AppState;
 use crate::error::AppError;
-use crate::notifiers::Notifier;
+use crate::notifiers::{NotificationKind, Notifier};
 use chrono::Utc;
 use std::sync::Arc;
 
@@ -204,22 +204,35 @@ impl Scheduler {
                     );
                 }
 
+                // Notify on incidents that are either brand new (unseen id) or
+                // whose content fingerprint changed since we last alerted — the
+                // latter catches in-place status updates (Investigating →
+                // Identified → Resolved) that all share a single stable id.
                 let new_incidents: Vec<_> = incidents
                     .iter()
-                    .filter(|incident| !self.state.has_seen(name, &incident.id))
+                    .filter(|incident| {
+                        self.state.seen_fingerprint(name, &incident.id)
+                            != Some(incident.fingerprint().as_str())
+                    })
                     .cloned()
                     .collect();
 
                 for incident in &new_incidents {
+                    let kind = if self.state.has_seen(name, &incident.id) {
+                        NotificationKind::Update
+                    } else {
+                        NotificationKind::New
+                    };
                     tracing::info!(
                         provider = name,
                         id = %incident.id,
                         title = %incident.title,
-                        "New incident detected",
+                        kind = ?kind,
+                        "Incident to notify",
                     );
-                    let notified = self.notify_all(incident).await;
+                    let notified = self.notify_all(incident, kind).await;
                     if notified {
-                        self.state.mark_seen(name, incident.id.clone());
+                        self.state.mark_seen(name, incident.id.clone(), incident.fingerprint());
                     } else {
                         tracing::warn!(
                             provider = name,
@@ -236,7 +249,7 @@ impl Scheduler {
                     tracing::debug!(
                         provider = name,
                         id = %incident.id,
-                        "Skipping already-seen incident: {}",
+                        "Skipping unchanged incident: {}",
                         incident.title,
                     );
                 }
@@ -277,7 +290,7 @@ impl Scheduler {
         }
     }
 
-    async fn notify_all(&self, incident: &Incident) -> bool {
+    async fn notify_all(&self, incident: &Incident, kind: NotificationKind) -> bool {
         let mut set = tokio::task::JoinSet::new();
 
         for notifier in &self.notifiers {
@@ -286,7 +299,7 @@ impl Scheduler {
             let incident = incident.clone();
             set.spawn(async move {
                 let name = notifier.name();
-                match notifier.notify(&client, &incident).await {
+                match notifier.notify(&client, &incident, kind).await {
                     Ok(_) => {
                         tracing::info!(
                             notifier = name,
@@ -352,6 +365,7 @@ impl Scheduler {
                 &self,
                 _client: &reqwest::Client,
                 _incident: &Incident,
+                _kind: crate::notifiers::NotificationKind,
             ) -> Result<(), AppError> {
                 Ok(())
             }
@@ -429,7 +443,7 @@ mod tests {
     #[async_trait]
     impl crate::notifiers::Notifier for SucceedingNotifier {
         fn name(&self) -> &'static str { "succeeding" }
-        async fn notify(&self, _: &reqwest::Client, _: &Incident) -> Result<(), AppError> {
+        async fn notify(&self, _: &reqwest::Client, _: &Incident, _: NotificationKind) -> Result<(), AppError> {
             Ok(())
         }
     }
@@ -439,7 +453,7 @@ mod tests {
     #[async_trait]
     impl crate::notifiers::Notifier for FailingNotifier {
         fn name(&self) -> &'static str { "failing" }
-        async fn notify(&self, _: &reqwest::Client, _: &Incident) -> Result<(), AppError> {
+        async fn notify(&self, _: &reqwest::Client, _: &Incident, _: NotificationKind) -> Result<(), AppError> {
             Err(AppError::TelegramApi { status: 500, body: "server error".into() })
         }
     }
@@ -449,7 +463,7 @@ mod tests {
     #[async_trait]
     impl crate::notifiers::Notifier for PanicNotifier {
         fn name(&self) -> &'static str { "panicking" }
-        async fn notify(&self, _: &reqwest::Client, _: &Incident) -> Result<(), AppError> {
+        async fn notify(&self, _: &reqwest::Client, _: &Incident, _: NotificationKind) -> Result<(), AppError> {
             panic!("simulated notifier panic");
         }
     }
@@ -877,7 +891,7 @@ mod tests {
             vec![],
             vec![Box::new(SucceedingNotifier)],
         );
-        assert!(scheduler.notify_all(&make_incident("i1")).await);
+        assert!(scheduler.notify_all(&make_incident("i1"), NotificationKind::New).await);
     }
 
     #[tokio::test]
@@ -894,7 +908,7 @@ mod tests {
             vec![],
             vec![Box::new(FailingNotifier)],
         );
-        assert!(!scheduler.notify_all(&make_incident("i1")).await);
+        assert!(!scheduler.notify_all(&make_incident("i1"), NotificationKind::New).await);
     }
 
     #[tokio::test]
@@ -911,7 +925,7 @@ mod tests {
             vec![],
             vec![Box::new(FailingNotifier), Box::new(SucceedingNotifier)],
         );
-        assert!(scheduler.notify_all(&make_incident("i1")).await);
+        assert!(scheduler.notify_all(&make_incident("i1"), NotificationKind::New).await);
     }
 
     #[tokio::test]
@@ -969,6 +983,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incident_renotified_only_when_content_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingNotifier {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl crate::notifiers::Notifier for CountingNotifier {
+            fn name(&self) -> &'static str { "counting" }
+            async fn notify(&self, _: &reqwest::Client, _: &Incident, _: NotificationKind) -> Result<(), AppError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = ConfigBuilder::new()
+            .providers(vec![])
+            .notifiers(vec![])
+            .state_file(state_path(&tmp))
+            .build()
+            .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = Scheduler::new_for_test_with_notifiers(
+            config,
+            vec![],
+            vec![Box::new(CountingNotifier { calls: Arc::clone(&calls) })],
+        );
+
+        // Same id throughout — only the description changes, mimicking how a
+        // status page mutates one incident in place across status transitions.
+        fn incident_with(desc: &str) -> Incident {
+            Incident {
+                provider: "stub".into(),
+                id: "inc-1".into(),
+                title: "TLS certificate issue".into(),
+                description: desc.into(),
+                link: "https://x.com".into(),
+                occurred_at: "Sun, 31 May 2026 06:00:00 GMT".into(),
+            }
+        }
+        async fn poll(scheduler: &mut Scheduler, desc: &str) {
+            let result = ProviderCheckResult { name: "stub", result: Ok(vec![incident_with(desc)]) };
+            scheduler.process_provider_result(result, &Utc::now()).await;
+        }
+
+        poll(&mut scheduler, "Investigating").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "first sighting should notify");
+
+        poll(&mut scheduler, "Investigating").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "unchanged incident must not re-notify");
+
+        poll(&mut scheduler, "Identified - a fix is being implemented").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "a content change (status update) must re-notify");
+
+        poll(&mut scheduler, "Identified - a fix is being implemented").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the same updated content must not re-notify again");
+    }
+
+    #[tokio::test]
     async fn notify_all_runs_notifiers_concurrently() {
         use std::time::{Duration, Instant};
 
@@ -985,6 +1061,7 @@ mod tests {
                 &self,
                 _client: &reqwest::Client,
                 _incident: &Incident,
+                _kind: NotificationKind,
             ) -> Result<(), AppError> {
                 tokio::time::sleep(self.delay).await;
                 Ok(())
@@ -1010,7 +1087,7 @@ mod tests {
         );
 
         let start = Instant::now();
-        let succeeded = scheduler.notify_all(&make_incident("i1")).await;
+        let succeeded = scheduler.notify_all(&make_incident("i1"), NotificationKind::New).await;
         let elapsed = start.elapsed();
 
         assert!(succeeded, "both notifiers should succeed");
@@ -1038,7 +1115,7 @@ mod tests {
         );
 
         // Panic inside the spawned task must not propagate — notify_all returns false
-        let succeeded = scheduler.notify_all(&make_incident("i1")).await;
+        let succeeded = scheduler.notify_all(&make_incident("i1"), NotificationKind::New).await;
         assert!(!succeeded, "panicking notifier should count as failed, not propagate");
     }
 
@@ -1059,7 +1136,7 @@ mod tests {
         );
 
         // The healthy notifier still fires — panic in one task must not abort the others
-        let succeeded = scheduler.notify_all(&make_incident("i1")).await;
+        let succeeded = scheduler.notify_all(&make_incident("i1"), NotificationKind::New).await;
         assert!(succeeded, "healthy notifier should still succeed despite sibling panic");
     }
 

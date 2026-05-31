@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::core::incident::Incident;
 use crate::error::AppError;
+use crate::notifiers::NotificationKind;
 use crate::utils::html;
 
 pub struct TelegramNotifier {
@@ -63,8 +64,9 @@ impl super::Notifier for TelegramNotifier {
         &self,
         client: &reqwest::Client,
         incident: &Incident,
+        kind: NotificationKind,
     ) -> Result<(), AppError> {
-        let text = format_message(incident);
+        let text = format_message(incident, kind);
         let url = format!("{}/bot{}/sendMessage", self.api_base_url, self.bot_token);
 
         let params = [
@@ -104,7 +106,7 @@ impl super::Notifier for TelegramNotifier {
     }
 }
 
-pub fn format_message(incident: &Incident) -> String {
+pub fn format_message(incident: &Incident, kind: NotificationKind) -> String {
     let formatted_date = html::format_pub_date(&incident.occurred_at);
     let title_escaped = html::escape_html(&incident.title);
     let date_escaped = html::escape_html(&formatted_date);
@@ -113,9 +115,15 @@ pub fn format_message(incident: &Incident) -> String {
     let desc_escaped = html::escape_html(&desc_plain);
     let provider_label = html::escape_html(&incident.provider);
 
+    let heading = match kind {
+        NotificationKind::New => "Incident",
+        NotificationKind::Update => "Incident Update",
+    };
+
     format!(
-        "<b>[{}] Incident</b>\n\n<b>{}</b>\n<i>{}</i>\n<a href=\"{}\">View full details</a>\n\n{}",
+        "<b>[{}] {}</b>\n\n<b>{}</b>\n<i>{}</i>\n<a href=\"{}\">View full details</a>\n\n{}",
         provider_label.to_uppercase(),
+        heading,
         title_escaped,
         date_escaped,
         link_escaped,
@@ -148,12 +156,23 @@ mod tests {
             "https://example.com/incident/1",
             "Thu, 21 May 2026 18:00:00 GMT",
         );
-        let msg = format_message(&incident);
+        let msg = format_message(&incident, NotificationKind::New);
 
-        assert!(msg.contains("[AZURE]"));
+        assert!(msg.contains("[AZURE] Incident</b>"));
         assert!(msg.contains("Azure DevOps - Investigating"));
         assert!(msg.contains("2026-05-21 18:00 UTC"));
         assert!(msg.contains("https://example.com/incident/1"));
+    }
+
+    #[test]
+    fn labels_update_distinctly_from_new() {
+        let incident = make_incident("cloudflare", "TLS issue", "Identified", "https://x.com", "");
+        let new_msg = format_message(&incident, NotificationKind::New);
+        let update_msg = format_message(&incident, NotificationKind::Update);
+
+        assert!(new_msg.contains("[CLOUDFLARE] Incident</b>"));
+        assert!(update_msg.contains("[CLOUDFLARE] Incident Update</b>"));
+        assert!(!new_msg.contains("Incident Update"));
     }
 
     #[test]
@@ -165,7 +184,7 @@ mod tests {
             "https://x.com",
             "",
         );
-        let msg = format_message(&incident);
+        let msg = format_message(&incident, NotificationKind::New);
 
         // Tags are stripped; entity is decoded then re-escaped for Telegram HTML mode
         assert!(msg.contains("bold &amp; italic"));
@@ -180,7 +199,7 @@ mod tests {
                     <p><small>May 28</small><br> \
                     <strong>Scheduled</strong> - Maintenance window.</p>";
         let incident = make_incident("twilio", "Maintenance", desc, "https://x.com", "");
-        let msg = format_message(&incident);
+        let msg = format_message(&incident, NotificationKind::New);
 
         assert!(msg.contains("SCHEDULED EVENT"));
         assert!(msg.contains("Maintenance window."));
@@ -192,17 +211,17 @@ mod tests {
     #[test]
     fn escapes_special_chars_in_link() {
         let incident = make_incident("azure", "T", "", "https://x.com?a=1&b=<2>", "");
-        let msg = format_message(&incident);
+        let msg = format_message(&incident, NotificationKind::New);
         assert!(msg.contains("https://x.com?a=1&amp;b=&lt;2&gt;"));
     }
 
     #[test]
     fn shows_provider_label() {
         let aws = make_incident("aws", "AWS Issue", "desc", "", "");
-        assert!(format_message(&aws).contains("[AWS]"));
+        assert!(format_message(&aws, NotificationKind::New).contains("[AWS]"));
 
         let twilio = make_incident("twilio", "Twilio Issue", "desc", "", "");
-        assert!(format_message(&twilio).contains("[TWILIO]"));
+        assert!(format_message(&twilio, NotificationKind::New).contains("[TWILIO]"));
     }
 
     #[test]

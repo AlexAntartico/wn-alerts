@@ -1,63 +1,97 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use crate::error::AppError;
 
 pub const MAX_SEEN_IDS_PER_PROVIDER: usize = 10_000;
 
-/// A set bounded to `MAX_SEEN_IDS_PER_PROVIDER` entries.
-/// When the cap is reached the oldest inserted entry is evicted (FIFO).
-/// Serializes as a plain JSON array for backward compatibility.
+/// A map of incident id → content fingerprint, bounded to
+/// `MAX_SEEN_IDS_PER_PROVIDER` entries. When the cap is reached the oldest
+/// inserted id is evicted (FIFO); updating the fingerprint of an existing id
+/// leaves its eviction position unchanged.
+///
+/// The fingerprint lets us tell a brand-new incident apart from an in-place
+/// status update to one we've already alerted on (see [`Incident::fingerprint`]).
+///
+/// Serializes as a JSON object `{ id: fingerprint }`. For backward
+/// compatibility it also deserializes the legacy form — a plain JSON array of
+/// ids — assigning each a sentinel empty fingerprint, so the first poll after
+/// upgrading re-syncs every incident to its real content state.
+///
+/// [`Incident::fingerprint`]: crate::core::incident::Incident::fingerprint
 #[derive(Debug, Clone, Default)]
 pub struct BoundedSeenSet {
-    ids: HashSet<String>,
+    fingerprints: HashMap<String, String>,
     order: VecDeque<String>,
 }
 
 impl BoundedSeenSet {
     pub fn contains(&self, id: &str) -> bool {
-        self.ids.contains(id)
+        self.fingerprints.contains_key(id)
     }
 
-    pub fn insert(&mut self, id: String) {
-        if self.ids.contains(&id) {
+    /// The fingerprint recorded for `id`, or `None` if the id has never been seen.
+    pub fn fingerprint(&self, id: &str) -> Option<&str> {
+        self.fingerprints.get(id).map(String::as_str)
+    }
+
+    pub fn insert(&mut self, id: String, fingerprint: String) {
+        if let Some(existing) = self.fingerprints.get_mut(&id) {
+            // Already tracked — just refresh the fingerprint, keep FIFO position.
+            *existing = fingerprint;
             return;
         }
-        if self.ids.len() >= MAX_SEEN_IDS_PER_PROVIDER {
+        if self.fingerprints.len() >= MAX_SEEN_IDS_PER_PROVIDER {
             if let Some(oldest) = self.order.pop_front() {
-                self.ids.remove(&oldest);
+                self.fingerprints.remove(&oldest);
             }
         }
-        self.ids.insert(id.clone());
+        self.fingerprints.insert(id.clone(), fingerprint);
         self.order.push_back(id);
     }
 
     pub fn len(&self) -> usize {
-        self.ids.len()
+        self.fingerprints.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
+        self.fingerprints.is_empty()
     }
 }
 
 impl Serialize for BoundedSeenSet {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq;
-        let mut seq = serializer.serialize_seq(Some(self.ids.len()))?;
-        for id in &self.ids {
-            seq.serialize_element(id)?;
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.fingerprints.len()))?;
+        for (id, fingerprint) in &self.fingerprints {
+            map.serialize_entry(id, fingerprint)?;
         }
-        seq.end()
+        map.end()
     }
 }
 
 impl<'de> Deserialize<'de> for BoundedSeenSet {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let ids: Vec<String> = Vec::deserialize(deserializer)?;
+        // Accept both the current map form and the legacy plain-array form.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Legacy(Vec<String>),
+            Versioned(HashMap<String, String>),
+        }
+
         let mut set = BoundedSeenSet::default();
-        for id in ids {
-            set.insert(id);
+        match Repr::deserialize(deserializer)? {
+            Repr::Legacy(ids) => {
+                for id in ids {
+                    set.insert(id, String::new());
+                }
+            }
+            Repr::Versioned(map) => {
+                for (id, fingerprint) in map {
+                    set.insert(id, fingerprint);
+                }
+            }
         }
         Ok(set)
     }
@@ -88,12 +122,23 @@ impl AppState {
             .unwrap_or(false)
     }
 
-    pub fn mark_seen(&mut self, provider: &str, id: String) {
+    /// The fingerprint last recorded for an incident, or `None` if unseen.
+    /// Compare against [`Incident::fingerprint`] to decide whether the incident
+    /// is new, unchanged, or carries a fresh status update.
+    ///
+    /// [`Incident::fingerprint`]: crate::core::incident::Incident::fingerprint
+    pub fn seen_fingerprint(&self, provider: &str, id: &str) -> Option<&str> {
+        self.providers
+            .get(provider)
+            .and_then(|s| s.seen_ids.fingerprint(id))
+    }
+
+    pub fn mark_seen(&mut self, provider: &str, id: String, fingerprint: String) {
         self.providers
             .entry(provider.to_string())
             .or_default()
             .seen_ids
-            .insert(id);
+            .insert(id, fingerprint);
     }
 
     pub fn set_poll_time(&mut self, provider: &str, time: String) {
@@ -189,27 +234,38 @@ mod tests {
     #[test]
     fn bounded_set_contains_inserted_ids() {
         let mut set = BoundedSeenSet::default();
-        set.insert("a".into());
-        set.insert("b".into());
+        set.insert("a".into(), "fp-a".into());
+        set.insert("b".into(), "fp-b".into());
         assert!(set.contains("a"));
         assert!(set.contains("b"));
         assert!(!set.contains("c"));
+        assert_eq!(set.fingerprint("a"), Some("fp-a"));
+        assert_eq!(set.fingerprint("c"), None);
     }
 
     #[test]
-    fn bounded_set_ignores_duplicates() {
+    fn bounded_set_ignores_duplicate_ids() {
         let mut set = BoundedSeenSet::default();
-        set.insert("id-1".into());
-        set.insert("id-1".into());
-        set.insert("id-1".into());
+        set.insert("id-1".into(), "fp".into());
+        set.insert("id-1".into(), "fp".into());
+        set.insert("id-1".into(), "fp".into());
         assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn bounded_set_updates_fingerprint_in_place() {
+        let mut set = BoundedSeenSet::default();
+        set.insert("id-1".into(), "old".into());
+        set.insert("id-1".into(), "new".into());
+        assert_eq!(set.len(), 1, "re-inserting an id must not grow the set");
+        assert_eq!(set.fingerprint("id-1"), Some("new"), "fingerprint should be updated");
     }
 
     #[test]
     fn bounded_set_caps_at_max_size() {
         let mut set = BoundedSeenSet::default();
         for i in 0..MAX_SEEN_IDS_PER_PROVIDER + 50 {
-            set.insert(format!("id-{}", i));
+            set.insert(format!("id-{}", i), "fp".into());
         }
         assert_eq!(set.len(), MAX_SEEN_IDS_PER_PROVIDER);
     }
@@ -219,7 +275,7 @@ mod tests {
         let mut set = BoundedSeenSet::default();
         // Insert exactly MAX entries, then one more.
         for i in 0..=MAX_SEEN_IDS_PER_PROVIDER {
-            set.insert(format!("id-{:010}", i)); // zero-padded so names are predictable
+            set.insert(format!("id-{:010}", i), "fp".into()); // zero-padded so names are predictable
         }
         // The first inserted entry should have been evicted.
         assert!(!set.contains("id-0000000000"), "oldest entry should be evicted");
@@ -231,24 +287,50 @@ mod tests {
     }
 
     #[test]
+    fn bounded_set_updating_fingerprint_does_not_reset_eviction_order() {
+        let mut set = BoundedSeenSet::default();
+        // Fill to capacity.
+        for i in 0..MAX_SEEN_IDS_PER_PROVIDER {
+            set.insert(format!("id-{:010}", i), "fp".into());
+        }
+        // Refresh the oldest entry's fingerprint — must NOT move it to the back.
+        set.insert("id-0000000000".into(), "refreshed".into());
+        // Inserting a new id should still evict the (still-oldest) id-0.
+        set.insert("id-new".into(), "fp".into());
+        assert!(!set.contains("id-0000000000"), "refreshing fingerprint must not save an entry from FIFO eviction");
+        assert!(set.contains("id-new"));
+    }
+
+    #[test]
     fn bounded_set_serde_roundtrip() {
         let mut set = BoundedSeenSet::default();
-        set.insert("alpha".into());
-        set.insert("beta".into());
-        set.insert("gamma".into());
+        set.insert("alpha".into(), "fp-alpha".into());
+        set.insert("beta".into(), "fp-beta".into());
+        set.insert("gamma".into(), "fp-gamma".into());
 
         let json = serde_json::to_string(&set).unwrap();
         let restored: BoundedSeenSet = serde_json::from_str(&json).unwrap();
 
-        assert!(restored.contains("alpha"));
-        assert!(restored.contains("beta"));
-        assert!(restored.contains("gamma"));
+        assert_eq!(restored.fingerprint("alpha"), Some("fp-alpha"));
+        assert_eq!(restored.fingerprint("beta"), Some("fp-beta"));
+        assert_eq!(restored.fingerprint("gamma"), Some("fp-gamma"));
         assert_eq!(restored.len(), 3);
     }
 
     #[test]
+    fn bounded_set_deserializes_legacy_array_form() {
+        // Pre-fingerprint state files stored seen ids as a plain JSON array.
+        let json = r#"["legacy-1","legacy-2"]"#;
+        let set: BoundedSeenSet = serde_json::from_str(json).unwrap();
+        assert!(set.contains("legacy-1"));
+        assert!(set.contains("legacy-2"));
+        // Legacy entries carry a sentinel empty fingerprint so the next poll re-syncs them.
+        assert_eq!(set.fingerprint("legacy-1"), Some(""));
+    }
+
+    #[test]
     fn bounded_set_prunes_on_deserialize_if_over_limit() {
-        // Build a JSON array with MAX+1 entries.
+        // Build a legacy JSON array with MAX+1 entries.
         let ids: Vec<String> = (0..=MAX_SEEN_IDS_PER_PROVIDER)
             .map(|i| format!("id-{}", i))
             .collect();
@@ -271,10 +353,19 @@ mod tests {
         let mut state = AppState::default();
         assert!(!state.has_seen("azure", "abc"));
 
-        state.mark_seen("azure", "abc".into());
+        state.mark_seen("azure", "abc".into(), "fp-1".into());
         assert!(state.has_seen("azure", "abc"));
+        assert_eq!(state.seen_fingerprint("azure", "abc"), Some("fp-1"));
         assert!(!state.has_seen("azure", "def"));
         assert!(!state.has_seen("aws", "abc"));
+    }
+
+    #[test]
+    fn mark_seen_updates_fingerprint_for_existing_incident() {
+        let mut state = AppState::default();
+        state.mark_seen("cloudflare", "inc-1".into(), "investigating".into());
+        state.mark_seen("cloudflare", "inc-1".into(), "identified".into());
+        assert_eq!(state.seen_fingerprint("cloudflare", "inc-1"), Some("identified"));
     }
 
     #[test]
@@ -293,8 +384,8 @@ mod tests {
     #[test]
     fn serialization_roundtrip() {
         let mut state = AppState::default();
-        state.mark_seen("azure", "guid-1".into());
-        state.mark_seen("azure", "guid-2".into());
+        state.mark_seen("azure", "guid-1".into(), "fp-1".into());
+        state.mark_seen("azure", "guid-2".into(), "fp-2".into());
         state.set_poll_time("azure", "2026-05-21T20:00:00Z".into());
 
         let json = serde_json::to_string(&state).unwrap();
@@ -302,6 +393,7 @@ mod tests {
 
         assert!(restored.has_seen("azure", "guid-1"));
         assert!(restored.has_seen("azure", "guid-2"));
+        assert_eq!(restored.seen_fingerprint("azure", "guid-1"), Some("fp-1"));
         assert_eq!(
             restored.providers.get("azure").and_then(|s| s.last_poll.as_deref()),
             Some("2026-05-21T20:00:00Z")
@@ -331,8 +423,8 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         let mut state = AppState::default();
-        state.mark_seen("azure", "guid-1".into());
-        state.mark_seen("aws", "guid-2".into());
+        state.mark_seen("azure", "guid-1".into(), "fp-1".into());
+        state.mark_seen("aws", "guid-2".into(), "fp-2".into());
         state.set_poll_time("azure", "2026-05-21T20:00:00Z".into());
 
         save_state(path_str, &state).unwrap();
@@ -444,11 +536,11 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         let mut state = AppState::default();
-        state.mark_seen("azure", "old-guid".into());
+        state.mark_seen("azure", "old-guid".into(), "fp-old".into());
         save_state(path_str, &state).unwrap();
 
         let mut state2 = AppState::default();
-        state2.mark_seen("azure", "new-guid".into());
+        state2.mark_seen("azure", "new-guid".into(), "fp-new".into());
         save_state(path_str, &state2).unwrap();
 
         let loaded = load_state(path_str).unwrap();
