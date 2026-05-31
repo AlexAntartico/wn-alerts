@@ -1,3 +1,7 @@
+// DISABLED: status.okta.com returns 401 — the feed requires authentication.
+// Re-enable by: (1) confirming a public unauthenticated feed exists, (2) uncommenting
+// `pub mod okta` and the match arm in src/providers/mod.rs.
+
 use super::rss_common::RssProvider;
 
 const ALLOWED_DOMAINS: &[&str] = &[

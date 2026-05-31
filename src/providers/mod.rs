@@ -2,10 +2,10 @@ pub mod airship;
 pub mod aws;
 pub mod azure;
 pub mod cloudflare;
-// pub mod f5;
+// pub mod f5; // disabled: domain gone, see src/providers/f5.rs
 pub mod github;
 pub mod imperva;
-// pub mod okta;
+// pub mod okta; // disabled: feed requires auth, see src/providers/okta.rs
 pub mod rss_common;
 pub mod twilio;
 

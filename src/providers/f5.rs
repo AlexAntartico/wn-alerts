@@ -1,3 +1,7 @@
+// DISABLED: status.f5.com domain is gone. Need to find the new home (likely on statuspage.io).
+// Re-enable by: (1) finding the new feed URL, (2) updating ALLOWED_DOMAINS, (3) uncommenting
+// `pub mod f5` and the match arm in src/providers/mod.rs.
+
 use super::rss_common::RssProvider;
 
 const ALLOWED_DOMAINS: &[&str] = &["status.f5.com"];
