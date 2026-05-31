@@ -152,7 +152,7 @@ impl Config {
     pub fn from_env() -> Result<Self, AppError> {
         let poll_interval = parse_env_u64("POLL_INTERVAL_MINUTES", "5")?;
         let timeout = parse_env_u64("REQUEST_TIMEOUT_SECS", "30")?;
-        let providers = parse_env_list("PROVIDERS", "azure,microsoft");
+        let providers = parse_env_list("PROVIDERS", "azure");
         let notifiers = parse_env_list("NOTIFIERS", "telegram");
         let state_file_path = env_or_default("STATE_FILE_PATH", "state.json");
         let failure_threshold = parse_env_optional_u32("PROVIDER_FAILURE_THRESHOLD")?;

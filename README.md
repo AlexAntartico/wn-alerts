@@ -150,6 +150,7 @@ All settings via environment variables or `.env` file.
 | `PROVIDER_AIRSHIP_FEED_URL` | `https://status.airship.com/rss` | Airship RSS feed endpoint |
 | `PROVIDER_GITHUB_FEED_URL` | `https://www.githubstatus.com/history.rss` | GitHub RSS feed endpoint |
 | `PROVIDER_CLOUDFLARE_FEED_URL` | `https://www.cloudflarestatus.com/history.rss` | Cloudflare RSS feed endpoint |
+| `PROVIDER_IMPERVA_FEED_URL` | `https://status.imperva.com/history.rss` | Imperva RSS feed endpoint |
 
 #### Provider backoff (optional)
 
@@ -212,11 +213,8 @@ For an RSS provider, delegate to `rss_common::RssProvider` — the struct, HTTP 
 ```rust
 use super::rss_common::RssProvider;
 
-// Allowed hostnames for SSRF protection (update for your provider)
-const ALLOWED_DOMAINS: &[&str] = &[
-    "www.githubstatus.com",
-    "githubstatus.com",
-];
+// Lock to the exact hostname(s) that serve the feed — no broader parent domains.
+const ALLOWED_DOMAINS: &[&str] = &["status.githubstatus.com"];
 const CONFIG_KEY: &str = "PROVIDER_GITHUB_FEED_URL";
 
 pub fn new(feed_url: String) -> RssProvider {
@@ -229,7 +227,9 @@ pub fn new_unvalidated(feed_url: String) -> RssProvider {
 }
 ```
 
-For a JSON provider (like Twilio), implement `StatusProvider` directly in the file. See `src/providers/twilio.rs` for the full pattern.
+The subdomain rule (`ends_with(".githubstatus.com")`) is applied automatically, so listing `www.githubstatus.com` explicitly is redundant — the bare domain entry is enough to cover it. Only list additional entries when the feed genuinely moves between distinct hostnames (e.g. Azure's `azure.status.microsoft` vs `status.azure.com`).
+
+For a JSON provider, implement `StatusProvider` directly in the file. See `src/providers/twilio.rs` for the full pattern.
 
 ### Step 2: Write unit tests (inside the same file)
 
