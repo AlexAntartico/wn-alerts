@@ -144,7 +144,7 @@ All settings via environment variables or `.env` file.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PROVIDERS` | `azure` | Comma-separated list of enabled providers |
-| `PROVIDER_AZURE_FEED_URL` | `https://azure.status.microsoft/en-us/status/feed/` | Azure RSS feed endpoint |
+| `PROVIDER_AZURE_FEED_URL` | `https://rssfeed.azure.status.microsoft/en-us/status/feed/` | Azure RSS feed endpoint |
 | `PROVIDER_AWS_FEED_URL` | `https://status.aws.amazon.com/rss/all.rss` | AWS RSS feed endpoint |
 | `PROVIDER_TWILIO_FEED_URL` | `https://status.twilio.com/history.rss` | Twilio RSS feed endpoint |
 | `PROVIDER_AIRSHIP_FEED_URL` | `https://status.airship.com/rss` | Airship RSS feed endpoint |

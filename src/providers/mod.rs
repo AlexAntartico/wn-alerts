@@ -27,7 +27,7 @@ fn build_one(name: &str, _config: &Config) -> Result<Box<dyn StatusProvider>, Ap
     match name {
         "azure" => {
             let feed_url = crate::config::provider_param("azure", "FEED_URL")
-                .unwrap_or_else(|| "https://azure.status.microsoft/en-us/status/feed/".into());
+                .unwrap_or_else(|| "https://rssfeed.azure.status.microsoft/en-us/status/feed/".into());
             Ok(Box::new(azure::new(feed_url)))
         }
         "aws" => {
