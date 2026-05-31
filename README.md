@@ -184,7 +184,7 @@ NOTIFIERS=telegram
 POLL_INTERVAL_MINUTES=5
 REQUEST_TIMEOUT_SECS=30
 
-PROVIDER_AZURE_FEED_URL=https://azure.status.microsoft/en-us/status/feed/
+PROVIDER_AZURE_FEED_URL=https://rssfeed.azure.status.microsoft/en-us/status/feed/
 
 # Optional: back off after 3 consecutive failures, skip up to 32 cycles (~2.7 hr at 5 min interval)
 # PROVIDER_FAILURE_THRESHOLD=3
