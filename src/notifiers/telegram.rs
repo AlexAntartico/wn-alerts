@@ -106,6 +106,12 @@ impl super::Notifier for TelegramNotifier {
     }
 }
 
+/// Telegram caps `sendMessage` `text` at 4096 UTF-16 code units. We count
+/// Unicode scalar values, which is conservative for the (mostly ASCII) status
+/// text, and leave headroom for the truncation marker.
+const TELEGRAM_MAX_CHARS: usize = 4096;
+const TRUNCATION_MARKER: &str = "\n\n…(truncated)";
+
 pub fn format_message(incident: &Incident, kind: NotificationKind) -> String {
     let formatted_date = html::format_pub_date(&incident.occurred_at);
     let title_escaped = html::escape_html(&incident.title);
@@ -120,15 +126,37 @@ pub fn format_message(incident: &Incident, kind: NotificationKind) -> String {
         NotificationKind::Update => "Incident Update",
     };
 
-    format!(
-        "<b>[{}] {}</b>\n\n<b>{}</b>\n<i>{}</i>\n<a href=\"{}\">View full details</a>\n\n{}",
+    // Everything except the description. The description is the last field, so
+    // capping the overall message means truncating only the description.
+    let prefix = format!(
+        "<b>[{}] {}</b>\n\n<b>{}</b>\n<i>{}</i>\n<a href=\"{}\">View full details</a>\n\n",
         provider_label.to_uppercase(),
         heading,
         title_escaped,
         date_escaped,
         link_escaped,
-        desc_escaped,
-    )
+    );
+
+    let prefix_len = prefix.chars().count();
+    let desc_budget = TELEGRAM_MAX_CHARS.saturating_sub(prefix_len);
+
+    if desc_escaped.chars().count() <= desc_budget {
+        return format!("{prefix}{desc_escaped}");
+    }
+
+    // Reserve room for the marker, then truncate without splitting an entity.
+    let marker_len = TRUNCATION_MARKER.chars().count();
+    let truncate_to = desc_budget.saturating_sub(marker_len);
+    let truncated = html::truncate_html_safe(&desc_escaped, truncate_to);
+    let msg = format!("{prefix}{truncated}{TRUNCATION_MARKER}");
+
+    // Defensive last resort: if the prefix alone already exceeds the limit
+    // (a pathologically long title/link), hard-cap the whole message so we
+    // never hand Telegram an over-length payload.
+    if msg.chars().count() > TELEGRAM_MAX_CHARS {
+        return html::truncate_html_safe(&msg, TELEGRAM_MAX_CHARS);
+    }
+    msg
 }
 
 #[cfg(test)]
@@ -222,6 +250,53 @@ mod tests {
 
         let twilio = make_incident("twilio", "Twilio Issue", "desc", "", "");
         assert!(format_message(&twilio, NotificationKind::New).contains("[TWILIO]"));
+    }
+
+    #[test]
+    fn short_message_is_not_truncated() {
+        let incident = make_incident("aws", "Title", "Short body", "https://x.com", "");
+        let msg = format_message(&incident, NotificationKind::New);
+        assert!(msg.contains("Short body"));
+        assert!(!msg.contains("(truncated)"));
+    }
+
+    #[test]
+    fn oversized_message_is_capped_at_telegram_limit() {
+        // A 10k-char description blows past Telegram's 4096 limit.
+        let huge = "A".repeat(10_000);
+        let incident = make_incident("github", "Big incident", &huge, "https://x.com", "");
+        let msg = format_message(&incident, NotificationKind::Update);
+
+        assert!(
+            msg.chars().count() <= TELEGRAM_MAX_CHARS,
+            "message is {} chars, exceeds {}",
+            msg.chars().count(),
+            TELEGRAM_MAX_CHARS
+        );
+        // Header is preserved and the body is marked as truncated.
+        assert!(msg.contains("[GITHUB] Incident Update</b>"));
+        assert!(msg.contains("Big incident"));
+        assert!(msg.contains("(truncated)"));
+    }
+
+    #[test]
+    fn truncation_does_not_split_html_entity() {
+        // Description of all '&' chars escapes to a run of "&amp;" entities.
+        // Truncating must never leave a dangling, unterminated entity.
+        let ampersands = "&".repeat(10_000);
+        let incident = make_incident("imperva", "Entities", &ampersands, "https://x.com", "");
+        let msg = format_message(&incident, NotificationKind::New);
+
+        assert!(msg.chars().count() <= TELEGRAM_MAX_CHARS);
+        // The body (after the prefix) must end on a complete entity, before the
+        // marker. Strip the marker, then confirm no trailing partial "&amp".
+        let body = msg.strip_suffix(TRUNCATION_MARKER).unwrap_or(&msg);
+        let last_amp = body.rfind('&').expect("escaped body contains entities");
+        assert!(
+            body[last_amp..].starts_with("&amp;"),
+            "message ends with a split entity: {:?}",
+            &body[last_amp..]
+        );
     }
 
     #[test]

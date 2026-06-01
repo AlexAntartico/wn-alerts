@@ -109,7 +109,7 @@ src/
 │   └── telegram.rs             # Telegram notifier (HTML-formatted, rate-limited)
 │
 ├── utils/
-│   └── html.rs                 # HTML tag stripping, entity decode/escape, date formatting
+│   └── html.rs                 # HTML tag stripping, entity decode/escape, entity-safe truncation, date formatting
 │
 ├── config.rs                   # ConfigBuilder + env parsing + validation + HTTP client
 ├── error.rs                    # AppError enum (thiserror)
@@ -195,6 +195,16 @@ Provider-specific config follows the pattern `PROVIDER_{NAME}_{KEY}`.
 | `NOTIFIER_TELEGRAM_CHAT_ID` | yes | Target chat ID |
 
 Notifier-specific config follows the pattern `NOTIFIER_{NAME}_{KEY}`.
+
+#### Message length
+
+Telegram rejects any `sendMessage` whose text exceeds **4096 characters** with `HTTP 400: message is too long`. Some providers (AWS, GitHub, Imperva) publish incidents with very long descriptions that blow past this limit. To keep those alerts deliverable:
+
+- Messages are capped at 4096 characters (counted as Unicode scalar values). The fixed header — `[PROVIDER] Incident`, title, date, link — is always preserved; only the description is trimmed.
+- When the description is trimmed, a `…(truncated)` marker is appended so it's clear the body was cut. Open the linked incident page for the full text.
+- Truncation never splits an HTML entity (e.g. `&amp;`), so the message stays valid for Telegram's HTML parse mode.
+
+Without this cap an over-length incident fails on every poll cycle (`All notifiers failed — incident will retry next cycle`) and is re-attempted indefinitely, never delivering.
 
 **Telegram Notification**
 
@@ -387,7 +397,7 @@ cargo test --test azure_provider    # run one provider's integration tests
 cargo test --test telegram_notifier # run notifier integration tests
 ```
 
-163 tests: 131 unit (providers, notifiers, state, config, HTML utils, scheduler) + 32 integration (wiremock-based HTTP tests).
+180 tests: 145 unit (providers, notifiers, state, config, HTML utils, scheduler) + 35 integration (wiremock-based HTTP tests).
 
 Integration tests live one file per provider/notifier under `tests/`. Shared fixtures (`RSS_ITEM_XML`, `build_client`) are in `tests/common/mod.rs`.
 

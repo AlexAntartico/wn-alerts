@@ -64,6 +64,28 @@ pub fn escape_html(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Truncate `s` to at most `max_chars` Unicode scalar values without splitting
+/// an HTML entity (e.g. `&amp;`). If the cut point falls inside an entity — an
+/// unmatched `&` with no closing `;` in the kept slice — we back up to just
+/// before that `&` so the result stays valid for Telegram's HTML parse mode.
+pub fn truncate_html_safe(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut end = s
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    let head = &s[..end];
+    if let Some(amp) = head.rfind('&') {
+        if !head[amp..].contains(';') {
+            end = amp;
+        }
+    }
+    s[..end].to_string()
+}
+
 pub fn format_pub_date(rfc2822: &str) -> String {
     chrono::DateTime::parse_from_rfc2822(rfc2822)
         .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
@@ -169,5 +191,36 @@ mod tests {
     #[test]
     fn strip_plain_text_passes_through() {
         assert_eq!(strip_html_tags("No tags here"), "No tags here");
+    }
+
+    #[test]
+    fn truncate_under_limit_passes_through() {
+        assert_eq!(truncate_html_safe("hello", 10), "hello");
+        assert_eq!(truncate_html_safe("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_cuts_to_max_chars() {
+        assert_eq!(truncate_html_safe("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn truncate_counts_chars_not_bytes() {
+        // Each 'é' is 2 bytes but 1 char; cutting at 2 chars must not split it.
+        assert_eq!(truncate_html_safe("éééé", 2), "éé");
+    }
+
+    #[test]
+    fn truncate_does_not_split_entity() {
+        // "ab&amp;cd" -> cutting mid-entity drops the whole "&amp;".
+        assert_eq!(truncate_html_safe("ab&amp;cd", 4), "ab");
+        assert_eq!(truncate_html_safe("ab&amp;cd", 5), "ab");
+        assert_eq!(truncate_html_safe("ab&amp;cd", 6), "ab");
+    }
+
+    #[test]
+    fn truncate_keeps_complete_entity() {
+        // Cutting exactly at the ';' keeps the full entity.
+        assert_eq!(truncate_html_safe("ab&amp;cd", 7), "ab&amp;");
     }
 }

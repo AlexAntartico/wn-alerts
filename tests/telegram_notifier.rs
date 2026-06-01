@@ -43,6 +43,56 @@ async fn sends_message() {
 }
 
 #[tokio::test]
+async fn caps_oversized_message_under_telegram_limit() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/bot123:test-token/sendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // A description far beyond Telegram's 4096-char cap — the bug that made the
+    // real API reject with HTTP 400 "message is too long".
+    let mut incident = make_incident("github", "tg-oversized");
+    incident.description = "A".repeat(10_000);
+
+    let notifier = wn_alerts::notifiers::telegram::TelegramNotifier::new(
+        "123:test-token".into(),
+        "456".into(),
+    )
+    .with_api_url(mock_server.uri())
+    .with_rate_limit_delay(std::time::Duration::from_millis(0));
+
+    let result = notifier
+        .notify(
+            &reqwest::Client::new(),
+            &incident,
+            wn_alerts::notifiers::NotificationKind::New,
+        )
+        .await;
+    assert!(result.is_ok(), "notify failed: {:?}", result.err());
+
+    // Inspect what actually went on the wire: the form-encoded `text` field
+    // must be within Telegram's limit.
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body = std::str::from_utf8(&requests[0].body).unwrap();
+    let text = url::form_urlencoded::parse(body.as_bytes())
+        .find(|(k, _)| k == "text")
+        .map(|(_, v)| v.into_owned())
+        .expect("request body has a `text` field");
+
+    assert!(
+        text.chars().count() <= 4096,
+        "sent text is {} chars, exceeds Telegram's 4096 limit",
+        text.chars().count()
+    );
+    assert!(text.contains("(truncated)"));
+}
+
+#[tokio::test]
 async fn handles_api_error() {
     let mock_server = MockServer::start().await;
 
