@@ -3,12 +3,18 @@ use super::rss_common::RssProvider;
 const ALLOWED_DOMAINS: &[&str] = &["status.cloud.microsoft"];
 const CONFIG_KEY: &str = "PROVIDER_MICROSOFT_MAC_FEED_URL";
 
+/// The feed always carries a steady-state placeholder item with this status and
+/// a pubDate that advances every poll; drop it so it doesn't churn alerts.
+const DROP_STATUSES: &[&str] = &["Available"];
+
 pub fn new(feed_url: String) -> RssProvider {
     RssProvider::new("microsoft_mac", feed_url, CONFIG_KEY, ALLOWED_DOMAINS)
+        .with_dropped_statuses(DROP_STATUSES)
 }
 
 pub fn new_unvalidated(feed_url: String) -> RssProvider {
     RssProvider::new_unvalidated("microsoft_mac", feed_url, CONFIG_KEY, ALLOWED_DOMAINS)
+        .with_dropped_statuses(DROP_STATUSES)
 }
 
 #[cfg(test)]
