@@ -206,9 +206,19 @@ Telegram rejects any `sendMessage` whose text exceeds **4096 characters** with `
 
 Without this cap an over-length incident fails on every poll cycle (`All notifiers failed — incident will retry next cycle`) and is re-attempted indefinitely, never delivering.
 
-**Telegram Notification**
+<details>
+    
+<summary>Telegram Notification - click to expand</summary>
 
-<img width="415" height="415" alt="image" src="https://github.com/user-attachments/assets/9d23ffe1-91ed-4989-ac59-3307ab6b579e" />
+**TG notification**
+
+<img width="400" height="564" alt="image" src="https://github.com/user-attachments/assets/4a971b6d-abc6-4083-97ed-58fa77652d46" />
+
+**GH notification page**
+
+<img width="972" height="668" alt="image" src="https://github.com/user-attachments/assets/8cf5a722-a008-473b-b8ae-b8085fb1212f" />
+
+</details>
 
 
 ### Example `.env`
